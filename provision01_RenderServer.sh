@@ -46,6 +46,47 @@ wget -q -O /opt/blender/activate_gpu.py https://raw.githubusercontent.com/aaryan
 mkdir -p /var/run/sshd
 service ssh start
 
+# ── 1b. LOG SERVER (serves provisioning + blender logs over HTTP) ──
+
+cat > /root/log_server.py << 'PYEOF'
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+
+TOKEN = os.environ.get('FOTON_INSTANCE_TOKEN', '')
+LOG_FILES = {
+    '/provisioning': '/var/log/portal/provisioning.log',
+    '/blender': '/root/blender.log'
+}
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        params = dict(p.split('=',1) for p in (self.path.split('?',1)[1] if '?' in self.path else '').split('&') if '=' in p)
+        if params.get('token') != TOKEN:
+            self.send_response(403); self.end_headers(); return
+        path = self.path.split('?')[0]
+        log_file = LOG_FILES.get(path)
+        if not log_file or not os.path.exists(log_file):
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        with open(log_file, 'rb') as f:
+            self.wfile.write(f.read())
+    def log_message(self, *args): pass
+
+HTTPServer(('0.0.0.0', 8081), Handler).serve_forever()
+PYEOF
+
+python3 /root/log_server.py &
+LOG_SERVER_PID=$!
+echo "[Foton] Log server started on port 8081 (PID: $LOG_SERVER_PID)"
+
+# Compute public log URL from Vast.ai env vars
+EXTERNAL_PORT=${VAST_TCP_PORT_8081:-8081}
+LOG_BASE_URL="http://${PUBLIC_IPADDR}:${EXTERNAL_PORT}"
+echo "[Foton] Log URL: ${LOG_BASE_URL}"
+
 # ── 2. HEARTBEAT (background keep-alive ping) ────────────────
 
 if [ -n "$FOTON_API_URL" ]; then
@@ -64,7 +105,7 @@ fi
 if [ -n "$FOTON_API_URL" ]; then
   RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
-    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"ready\"}")
+    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"ready\", \"logBaseUrl\": \"${LOG_BASE_URL}\"}")
   echo "[Foton] Reported ready to API."
 
   # Extract blend download URL from response
@@ -119,12 +160,14 @@ export MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.l
 echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}, samples=${MAX_SAMPLES}"
 
 # Map file extension to Blender format string
+# Also normalize FILE_EXT to match what Blender actually writes on disk
+# (e.g. Blender saves JPEG as .jpg, TIFF as .tif)
 case "$FILE_EXT" in
   exr)      export BLENDER_FORMAT="OPEN_EXR" ;;
   png)      export BLENDER_FORMAT="PNG" ;;
-  jpeg|jpg) export BLENDER_FORMAT="JPEG" ;;
-  tiff|tif) export BLENDER_FORMAT="TIFF" ;;
-  *)        export BLENDER_FORMAT="PNG" ;;
+  jpeg|jpg) export BLENDER_FORMAT="JPEG"; FILE_EXT="jpg" ;;
+  tiff|tif) export BLENDER_FORMAT="TIFF"; FILE_EXT="tif" ;;
+  *)        export BLENDER_FORMAT="PNG"; FILE_EXT="png" ;;
 esac
 
 # ═══════════════════════════════════════════════════════════════
