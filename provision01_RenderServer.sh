@@ -1,17 +1,31 @@
 #!/bin/bash
 
-# --- FOTONLABS PROVISIONING PROTOCOL ---
+# ═══════════════════════════════════════════════════════════════
+# FOTONLABS PROVISIONING PROTOCOL — Watchdog Architecture
+# ═══════════════════════════════════════════════════════════════
+#
+# Blender renders all frames natively via the -a flag (zero overhead).
+# A parallel watcher loop detects completed frames on disk, uploads
+# them to R2, reports progress, and handles cancellation.
+#
+# Old approach: bash for-loop launched Blender N times (once per frame).
+#   → Paid full startup cost (load scene, compile shaders, build BVH) N times.
+#
+# New approach: Blender launches ONCE, renders the full animation.
+#   → Startup cost paid once. Watcher uploads frames as they finish.
+# ═══════════════════════════════════════════════════════════════
 
-# 1. MARKER: Create a flag so we know installation is in progress
+# ── 1. PROVISIONING ──────────────────────────────────────────
+
 touch /root/installing
 echo "[Foton] Starting Provisioning..."
 
-# 2. INSTALL SYSTEM DEPENDENCIES
+# Install system dependencies
 apt-get update -qq
 apt-get install -y -qq wget xz-utils libgl1 libxrandr2 libxinerama1 \
   libxcursor1 libxi6 libxxf86vm1 libsm6 libxext6 openssh-server python3 curl
 
-# 3. INSTALL BLENDER 5.0.1
+# Install Blender 5.0.1
 if [ ! -d "/opt/blender" ]; then
   echo "[Foton] Downloading Blender 5.0.1..."
   wget -q https://download.blender.org/release/Blender5.0/blender-5.0.1-linux-x64.tar.xz
@@ -24,32 +38,29 @@ else
   echo "[Foton] Blender already installed. Skipping download."
 fi
 
-# 4. DOWNLOAD YOUR GPU ACTIVATION SCRIPT
-echo "[Foton] Fetching GPU Logic from GitHub..."
+# Download GPU activation script
+echo "[Foton] Fetching GPU activation script..."
 wget -q -O /opt/blender/activate_gpu.py https://raw.githubusercontent.com/aaryansachdeva/fotonRenderStartupScripts/refs/heads/main/activate_gpu.py
 
-# 5. SETUP SSH
+# SSH
 mkdir -p /var/run/sshd
 service ssh start
 
-# 6. START HEARTBEAT (runs in background)
+# ── 2. HEARTBEAT (background keep-alive ping) ────────────────
+
 if [ -n "$FOTON_API_URL" ]; then
   (while true; do
-      RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/heartbeat" \
+      curl -s -X POST "${FOTON_API_URL}/instances/heartbeat" \
         -H "Content-Type: application/json" \
-        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}")
-      ACTION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action') or '')" 2>/dev/null)
-      if [ "$ACTION" = "shutdown" ]; then
-          echo "[Foton] Shutdown signal received. Exiting."
-          exit 0
-      fi
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" > /dev/null
       sleep 30
   done) &
   HEARTBEAT_PID=$!
   echo "[Foton] Heartbeat started (PID: $HEARTBEAT_PID)."
 fi
 
-# 7. REPORT READY & DOWNLOAD BLEND FILE
+# ── 3. REPORT READY & DOWNLOAD BLEND FILE ────────────────────
+
 if [ -n "$FOTON_API_URL" ]; then
   RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
@@ -77,14 +88,15 @@ if [ -n "$FOTON_API_URL" ]; then
   echo "[Foton] Blend file ready."
 fi
 
-# 8. MARKER: PROVISIONING DONE
+# Provisioning done
 rm /root/installing
 touch /root/ready
 echo "[Foton] Node Fully Provisioned & Ready."
 
 # ═══════════════════════════════════════════════════════════════
-# 9. FETCH RENDER CONFIG
+# 4. FETCH RENDER CONFIG
 # ═══════════════════════════════════════════════════════════════
+
 if [ -z "$FOTON_API_URL" ]; then
   echo "[Foton] No API URL set. Skipping render."
   exit 0
@@ -93,188 +105,290 @@ fi
 echo "[Foton] Fetching render config..."
 CONFIG=$(curl -s "${FOTON_API_URL}/instances/render-config?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}")
 
-FRAME_START=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['frameStart'])")
-FRAME_END=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameEnd'])")
-FRAME_INC=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameIncrement'])")
-RES_X=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionX'])")
-RES_Y=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionY'])")
-CAMERA=$(echo "$CONFIG"       | python3 -c "import sys,json; print(json.load(sys.stdin)['camera'])")
-RENDER_ENGINE=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['renderEngine'])")
-FILE_EXT=$(echo "$CONFIG"     | python3 -c "import sys,json; print(json.load(sys.stdin)['fileExtension'])")
-OUTPUT_NAMING=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputFileNaming'])")
-MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['maxSamples'])")
+export FRAME_START=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['frameStart'])")
+export FRAME_END=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameEnd'])")
+export FRAME_INC=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameIncrement'])")
+export RES_X=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionX'])")
+export RES_Y=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionY'])")
+export CAMERA=$(echo "$CONFIG"       | python3 -c "import sys,json; print(json.load(sys.stdin)['camera'])")
+export RENDER_ENGINE=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['renderEngine'])")
+export FILE_EXT=$(echo "$CONFIG"     | python3 -c "import sys,json; print(json.load(sys.stdin)['fileExtension'])")
+export OUTPUT_NAMING=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputFileNaming'])")
+export MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['maxSamples'])")
 
 echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}, samples=${MAX_SAMPLES}"
 
 # Map file extension to Blender format string
 case "$FILE_EXT" in
-  exr)      BLENDER_FORMAT="OPEN_EXR" ;;
-  png)      BLENDER_FORMAT="PNG" ;;
-  jpeg|jpg) BLENDER_FORMAT="JPEG" ;;
-  tiff|tif) BLENDER_FORMAT="TIFF" ;;
-  *)        BLENDER_FORMAT="PNG" ;;
+  exr)      export BLENDER_FORMAT="OPEN_EXR" ;;
+  png)      export BLENDER_FORMAT="PNG" ;;
+  jpeg|jpg) export BLENDER_FORMAT="JPEG" ;;
+  tiff|tif) export BLENDER_FORMAT="TIFF" ;;
+  *)        export BLENDER_FORMAT="PNG" ;;
 esac
 
 # ═══════════════════════════════════════════════════════════════
-# 10. CREATE RENDER SETUP SCRIPT
+# 5. CREATE SCENE SETUP SCRIPT
 # ═══════════════════════════════════════════════════════════════
+# This script configures Blender's scene settings (resolution, camera,
+# engine, samples, frame range, output format) then exits.
+# Blender's -a flag takes over and renders the full animation natively.
+
 mkdir -p /root/output
 
 cat > /root/render_setup.py << 'PYEOF'
 import bpy
+import os
 import sys
 
-# Parse custom args after "--"
-argv = sys.argv
-args = argv[argv.index("--") + 1:] if "--" in argv else []
+def env(key):
+    val = os.environ.get(key)
+    if val is None:
+        print(f"[Foton] FATAL: Missing env var {key}")
+        sys.exit(1)
+    return val
 
-if len(args) < 7:
-    print("[Foton] render_setup.py: not enough args, skipping setup")
-else:
-    res_x = int(args[0])
-    res_y = int(args[1])
-    camera_name = args[2]
-    engine = args[3]
-    fmt = args[4]
-    output_path = args[5]
-    max_samples = int(args[6])
+RES_X = int(env('RES_X'))
+RES_Y = int(env('RES_Y'))
+FRAME_START = int(env('FRAME_START'))
+FRAME_END = int(env('FRAME_END'))
+FRAME_INC = int(env('FRAME_INC'))
+CAMERA = env('CAMERA')
+ENGINE = env('RENDER_ENGINE')
+SAMPLES = int(env('MAX_SAMPLES'))
+FILE_FORMAT = env('BLENDER_FORMAT')
+OUTPUT_NAMING = env('OUTPUT_NAMING')
 
-    scene = bpy.context.scene
+scene = bpy.context.scene
 
-    # Resolution
-    scene.render.resolution_x = res_x
-    scene.render.resolution_y = res_y
-    scene.render.resolution_percentage = 100
+# Resolution
+scene.render.resolution_x = RES_X
+scene.render.resolution_y = RES_Y
+scene.render.resolution_percentage = 100
 
-    # Camera
-    if camera_name and camera_name in bpy.data.objects:
-        scene.camera = bpy.data.objects[camera_name]
+# Frame range — the -a flag uses these scene properties
+scene.frame_start = FRAME_START
+scene.frame_end = FRAME_END
+scene.frame_step = FRAME_INC
 
-    # Render engine
-    if engine:
-        scene.render.engine = engine
+# Camera
+if CAMERA and CAMERA in bpy.data.objects:
+    scene.camera = bpy.data.objects[CAMERA]
 
-    # Max samples
-    if max_samples > 0:
-        if engine == "CYCLES":
-            scene.cycles.samples = max_samples
-        elif engine in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"):
-            scene.eevee.taa_render_samples = max_samples
+# Render engine
+if ENGINE:
+    scene.render.engine = ENGINE
 
-    # Output format & path
-    scene.render.image_settings.file_format = fmt
-    scene.render.filepath = output_path
-    scene.render.use_file_extension = True
+# Samples
+if SAMPLES > 0:
+    if ENGINE == 'CYCLES':
+        scene.cycles.samples = SAMPLES
+        scene.cycles.device = 'GPU'
+    elif ENGINE in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):
+        scene.eevee.taa_render_samples = SAMPLES
 
-    # GPU setup for Cycles
-    if engine == "CYCLES":
-        scene.cycles.device = "GPU"
-        prefs = bpy.context.preferences.addons["cycles"].preferences
-        prefs.compute_device_type = "CUDA"
-        prefs.get_devices()
-        for device in prefs.devices:
-            device.use = True
-        print(f"[Foton] GPU devices: {[d.name for d in prefs.devices if d.use]}")
+# Output format and filepath
+# Blender's -a flag appends the frame number (4-digit padded) to this prefix
+scene.render.image_settings.file_format = FILE_FORMAT
+scene.render.filepath = f"/root/output/{OUTPUT_NAMING}_"
+scene.render.use_file_extension = True
 
-    print(f"[Foton] Scene setup: {res_x}x{res_y}, camera={camera_name}, engine={engine}, format={fmt}, samples={max_samples}")
+print(f"[Foton] Scene configured: {RES_X}x{RES_Y}, frames {FRAME_START}-{FRAME_END} step {FRAME_INC}, engine={ENGINE}, format={FILE_FORMAT}, samples={SAMPLES}")
 PYEOF
 
 echo "[Foton] Render setup script created."
 
 # ═══════════════════════════════════════════════════════════════
-# 11. TRANSITION TO RENDERING
+# 6. TRANSITION TO RENDERING
 # ═══════════════════════════════════════════════════════════════
+
 curl -s -X POST "${FOTON_API_URL}/instances/report" \
   -H "Content-Type: application/json" \
   -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"rendering\"}"
 echo "[Foton] Status → rendering"
 
 # ═══════════════════════════════════════════════════════════════
-# 12. RENDER LOOP — frame by frame
+# 7. LAUNCH BLENDER (background) + WATCHDOG LOOP (foreground)
 # ═══════════════════════════════════════════════════════════════
-RENDER_FAILED=false
-FAILED_FRAME=""
+# Blender renders all frames natively with -a.
+# The watcher detects completed files and uploads them in parallel.
+#
+# Safe-gap rule: a frame file is only uploaded once the NEXT frame's
+# file also exists on disk (proving the current one is fully written).
+# The final frame is uploaded after Blender exits.
 
-for FRAME in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
-  PADDED=$(printf "%04d" "$FRAME")
-  OUTPUT_PREFIX="/root/output/${OUTPUT_NAMING}_"
-  EXPECTED_FILE="/root/output/${OUTPUT_NAMING}_${PADDED}.${FILE_EXT}"
+/opt/blender/blender -b /root/scene.blend \
+  -P /opt/blender/activate_gpu.py \
+  -P /root/render_setup.py \
+  -a &
+BLENDER_PID=$!
+echo "[Foton] Blender started (PID: $BLENDER_PID)"
 
-  echo "──────────────────────────────────────────"
-  echo "[Foton] Rendering frame ${FRAME} / ${FRAME_END}..."
-
-  # Render single frame — filepath set to prefix, Blender appends frame number
-  /opt/blender/blender -b /root/scene.blend \
-    -P /opt/blender/activate_gpu.py \
-    -P /root/render_setup.py \
-    -f "$FRAME" \
-    -- "$RES_X" "$RES_Y" "$CAMERA" "$RENDER_ENGINE" "$BLENDER_FORMAT" "$OUTPUT_PREFIX" "$MAX_SAMPLES"
-
-  BLENDER_EXIT=$?
-
-  # Verify output file exists
-  if [ $BLENDER_EXIT -ne 0 ] || [ ! -f "$EXPECTED_FILE" ]; then
-    echo "[Foton] ERROR: Frame ${FRAME} failed (exit code: ${BLENDER_EXIT})"
-    RENDER_FAILED=true
-    FAILED_FRAME=$FRAME
-    break
-  fi
-
-  FILE_SIZE=$(stat -c%s "$EXPECTED_FILE" 2>/dev/null || echo "?")
-  echo "[Foton] Frame ${FRAME} rendered (${FILE_SIZE} bytes). Uploading..."
-
-  # Get presigned upload URL
-  UPLOAD_RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/frame-upload-url" \
-    -H "Content-Type: application/json" \
-    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"frameNumber\": ${FRAME}}")
-
-  UPLOAD_URL=$(echo "$UPLOAD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadUrl') or '')" 2>/dev/null)
-
-  if [ -z "$UPLOAD_URL" ]; then
-    echo "[Foton] ERROR: Failed to get upload URL for frame ${FRAME}"
-    RENDER_FAILED=true
-    FAILED_FRAME=$FRAME
-    break
-  fi
-
-  # Upload rendered frame to R2
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
-    -H "Content-Type: application/octet-stream" \
-    --data-binary "@${EXPECTED_FILE}")
-
-  if [ "$HTTP_CODE" != "200" ]; then
-    echo "[Foton] ERROR: Upload failed for frame ${FRAME} (HTTP ${HTTP_CODE})"
-    RENDER_FAILED=true
-    FAILED_FRAME=$FRAME
-    break
-  fi
-
-  echo "[Foton] Frame ${FRAME} uploaded to R2."
-
-  # Report progress
-  curl -s -X POST "${FOTON_API_URL}/instances/progress" \
-    -H "Content-Type: application/json" \
-    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}"
-
-  # Clean up local file to save disk space
-  rm -f "$EXPECTED_FILE"
-
+# Build ordered list of expected frame numbers
+EXPECTED_FRAMES=()
+for f in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
+  EXPECTED_FRAMES+=("$f")
 done
+TOTAL=${#EXPECTED_FRAMES[@]}
+echo "[Foton] Expecting ${TOTAL} frames."
+
+# ── Watchdog Loop ─────────────────────────────────────────────
+
+NEXT=0            # Index into EXPECTED_FRAMES of next frame to upload
+HB_TICK=0         # Counter for heartbeat checks (~every 30s)
+CANCELLED=false
+BLENDER_EXIT=0
+
+while true; do
+
+  # ── Check if Blender is still running ──
+  BLENDER_ALIVE=true
+  if ! kill -0 "$BLENDER_PID" 2>/dev/null; then
+    BLENDER_ALIVE=false
+    wait "$BLENDER_PID" 2>/dev/null
+    BLENDER_EXIT=$?
+  fi
+
+  # ── Upload all safe frames ──
+  while [ "$NEXT" -lt "$TOTAL" ]; do
+    FRAME=${EXPECTED_FRAMES[$NEXT]}
+    PADDED=$(printf "%04d" "$FRAME")
+    FILE="/root/output/${OUTPUT_NAMING}_${PADDED}.${FILE_EXT}"
+
+    # Frame file must exist on disk
+    [ ! -f "$FILE" ] && break
+
+    # Safe-gap check: only upload if next frame also exists OR Blender has exited
+    SAFE=false
+    if [ "$BLENDER_ALIVE" = false ]; then
+      # Blender is done — all existing files are fully written
+      SAFE=true
+    elif [ $(( NEXT + 1 )) -lt "$TOTAL" ]; then
+      # Check if the next expected frame file exists
+      NF=${EXPECTED_FRAMES[$(( NEXT + 1 ))]}
+      NP=$(printf "%04d" "$NF")
+      [ -f "/root/output/${OUTPUT_NAMING}_${NP}.${FILE_EXT}" ] && SAFE=true
+    fi
+    [ "$SAFE" = false ] && break
+
+    # ── Get presigned upload URL (with retry) ──
+    UPLOAD_URL=""
+    for RETRY in 1 2 3; do
+      UPLOAD_URL=$(curl -s -X POST "${FOTON_API_URL}/instances/frame-upload-url" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"frameNumber\": ${FRAME}}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadUrl') or '')" 2>/dev/null)
+      [ -n "$UPLOAD_URL" ] && break
+      echo "[Foton] Retry ${RETRY}: failed to get upload URL for frame ${FRAME}"
+      sleep 2
+    done
+
+    if [ -z "$UPLOAD_URL" ]; then
+      echo "[Foton] ERROR: No upload URL for frame ${FRAME} after 3 retries. Aborting."
+      kill "$BLENDER_PID" 2>/dev/null
+      wait "$BLENDER_PID" 2>/dev/null
+      BLENDER_ALIVE=false
+      BLENDER_EXIT=1
+      break 2
+    fi
+
+    # ── Upload file to R2 (with retry) ──
+    UPLOAD_OK=false
+    for RETRY in 1 2 3; do
+      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@${FILE}")
+      if [ "$HTTP_CODE" = "200" ]; then
+        UPLOAD_OK=true
+        break
+      fi
+      echo "[Foton] Retry ${RETRY}: upload for frame ${FRAME} returned HTTP ${HTTP_CODE}"
+      sleep 2
+    done
+
+    if [ "$UPLOAD_OK" = false ]; then
+      echo "[Foton] ERROR: Upload failed for frame ${FRAME} after 3 retries. Aborting."
+      kill "$BLENDER_PID" 2>/dev/null
+      wait "$BLENDER_PID" 2>/dev/null
+      BLENDER_ALIVE=false
+      BLENDER_EXIT=1
+      break 2
+    fi
+
+    # ── Report progress ──
+    curl -s -X POST "${FOTON_API_URL}/instances/progress" \
+      -H "Content-Type: application/json" \
+      -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}" > /dev/null
+
+    # Clean up to save disk
+    rm -f "$FILE"
+    NEXT=$(( NEXT + 1 ))
+    echo "[Foton] Frame ${FRAME} uploaded. (${NEXT}/${TOTAL})"
+  done
+
+  # ── Exit conditions ──
+
+  # All frames uploaded — success
+  if [ "$NEXT" -ge "$TOTAL" ]; then
+    echo "[Foton] All ${TOTAL} frames uploaded."
+    break
+  fi
+
+  # Blender exited but frames are missing — failure
+  if [ "$BLENDER_ALIVE" = false ]; then
+    if [ "$BLENDER_EXIT" -ne 0 ]; then
+      echo "[Foton] Blender crashed (exit code ${BLENDER_EXIT}). ${NEXT}/${TOTAL} frames uploaded."
+    else
+      echo "[Foton] Blender finished but only ${NEXT}/${TOTAL} frames were found."
+    fi
+    break
+  fi
+
+  # ── Heartbeat / cancellation check (~every 30s) ──
+  HB_TICK=$(( HB_TICK + 1 ))
+  if [ "$HB_TICK" -ge 15 ]; then
+    HB_TICK=0
+    HB_ACTION=$(curl -s -X POST "${FOTON_API_URL}/instances/heartbeat" \
+      -H "Content-Type: application/json" \
+      -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" \
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('action') or '')" 2>/dev/null)
+    if [ "$HB_ACTION" = "shutdown" ]; then
+      echo "[Foton] Shutdown signal received. Killing Blender..."
+      kill "$BLENDER_PID" 2>/dev/null
+      wait "$BLENDER_PID" 2>/dev/null
+      CANCELLED=true
+      break
+    fi
+  fi
+
+  sleep 2
+done
+
+# Kill background heartbeat
+kill "$HEARTBEAT_PID" 2>/dev/null
 
 echo "══════════════════════════════════════════"
 
 # ═══════════════════════════════════════════════════════════════
-# 13. REPORT FINAL STATUS
+# 8. REPORT FINAL STATUS
 # ═══════════════════════════════════════════════════════════════
-if [ "$RENDER_FAILED" = true ]; then
-  echo "[Foton] Render FAILED at frame ${FAILED_FRAME}."
-  FINAL_STATUS="failed"
-else
-  echo "[Foton] All frames rendered and uploaded successfully!"
-  FINAL_STATUS="completed"
+
+if [ "$CANCELLED" = true ]; then
+  # Task status is already 'cancelled' (set by the client).
+  # No report needed — just exit cleanly.
+  echo "[Foton] Task was cancelled. Exiting."
+  exit 0
 fi
 
-# Retry final report up to 3 times to ensure status is updated and instance is destroyed
+if [ "$NEXT" -ge "$TOTAL" ]; then
+  FINAL_STATUS="completed"
+else
+  FINAL_STATUS="failed"
+fi
+
+echo "[Foton] Reporting: ${FINAL_STATUS}"
+
+# Retry final report up to 3 times to ensure the API receives it
 for ATTEMPT in 1 2 3; do
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
@@ -288,3 +402,5 @@ for ATTEMPT in 1 2 3; do
     sleep 5
   fi
 done
+
+echo "[Foton] Done."
