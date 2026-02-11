@@ -37,11 +37,31 @@ wget -q -O /opt/blender/activate_gpu.py https://raw.githubusercontent.com/aaryan
 mkdir -p /var/run/sshd
 service ssh start
 
-if [ -n "$FOTON_API_URL" ]; then         
+if [ -n "$FOTON_API_URL" ]; then
+      RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/report" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"ready\"}")
+      echo "[Foton] Reported ready to API."
+
+      # Extract blend download URL from response
+      BLEND_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl',''))" 2>/dev/null)
+
+      # If upload isn't done yet, poll until it is
+      while [ -z "$BLEND_URL" ]; do
+          echo "[Foton] Waiting for blend file upload..."
+          sleep 5
+          BLEND_URL=$(curl -s "${FOTON_API_URL}/instances/blend-url?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl',''))" 2>/dev/null)
+      done
+
+      echo "[Foton] Downloading blend file..."
+      curl -o /root/scene.blend "$BLEND_URL"
+
+      # Report blend downloaded
       curl -s -X POST "${FOTON_API_URL}/instances/report" \
         -H "Content-Type: application/json" \
-        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"ready\"}"
-      echo "[Foton] Reported ready to Foton API."
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"blendDownloaded\": true}"
+      echo "[Foton] Blend file ready."
 fi
 
 # 6. MARKER: DONE
