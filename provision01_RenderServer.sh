@@ -217,12 +217,15 @@ echo "[Foton] Status → rendering"
 # file also exists on disk (proving the current one is fully written).
 # The final frame is uploaded after Blender exits.
 
+BLENDER_LOG="/root/blender.log"
+> "$BLENDER_LOG"
+
 /opt/blender/blender -b /root/scene.blend \
   -P /opt/blender/activate_gpu.py \
   -P /root/render_setup.py \
-  -a &
+  -a > "$BLENDER_LOG" 2>&1 &
 BLENDER_PID=$!
-echo "[Foton] Blender started (PID: $BLENDER_PID)"
+echo "[Foton] Blender started (PID: $BLENDER_PID), logging to $BLENDER_LOG"
 
 # Build ordered list of expected frame numbers
 EXPECTED_FRAMES=()
@@ -238,6 +241,7 @@ NEXT=0            # Index into EXPECTED_FRAMES of next frame to upload
 HB_TICK=0         # Counter for heartbeat checks (~every 30s)
 CANCELLED=false
 BLENDER_EXIT=0
+LOG_OFFSET=0      # Track how far we've read in the Blender log
 
 while true; do
 
@@ -315,15 +319,37 @@ while true; do
       break 2
     fi
 
+    # ── Parse Blender's render time from log ──
+    # Blender prints: " Time: 00:19.10 (Saving: 00:00.07)" after each frame.
+    # We read new log lines since last check and find the Time line for this frame.
+    RENDER_TIME=""
+    NEW_LOG=$(tail -c +$(( LOG_OFFSET + 1 )) "$BLENDER_LOG" 2>/dev/null)
+    LOG_OFFSET=$(wc -c < "$BLENDER_LOG")
+
+    # Extract the last "Time:" line from new log chunk (corresponds to this frame)
+    TIME_LINE=$(echo "$NEW_LOG" | grep -oP 'Time:\s+\K[0-9]+:[0-9]+\.[0-9]+' | tail -1)
+    if [ -n "$TIME_LINE" ]; then
+      # Parse MM:SS.ms → seconds
+      MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
+      SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
+      RENDER_TIME=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
+    fi
+
     # ── Report progress ──
-    curl -s -X POST "${FOTON_API_URL}/instances/progress" \
-      -H "Content-Type: application/json" \
-      -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}" > /dev/null
+    if [ -n "$RENDER_TIME" ]; then
+      curl -s -X POST "${FOTON_API_URL}/instances/progress" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}, \"renderTime\": ${RENDER_TIME}}" > /dev/null
+    else
+      curl -s -X POST "${FOTON_API_URL}/instances/progress" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}" > /dev/null
+    fi
 
     # Clean up to save disk
     rm -f "$FILE"
     NEXT=$(( NEXT + 1 ))
-    echo "[Foton] Frame ${FRAME} uploaded. (${NEXT}/${TOTAL})"
+    echo "[Foton] Frame ${FRAME} uploaded. (${NEXT}/${TOTAL}${RENDER_TIME:+, ${RENDER_TIME}s})"
   done
 
   # ── Exit conditions ──
