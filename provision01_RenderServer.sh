@@ -102,8 +102,9 @@ CAMERA=$(echo "$CONFIG"       | python3 -c "import sys,json; print(json.load(sys
 RENDER_ENGINE=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['renderEngine'])")
 FILE_EXT=$(echo "$CONFIG"     | python3 -c "import sys,json; print(json.load(sys.stdin)['fileExtension'])")
 OUTPUT_NAMING=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputFileNaming'])")
+MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['maxSamples'])")
 
-echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}"
+echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}, samples=${MAX_SAMPLES}"
 
 # Map file extension to Blender format string
 case "$FILE_EXT" in
@@ -127,7 +128,7 @@ import sys
 argv = sys.argv
 args = argv[argv.index("--") + 1:] if "--" in argv else []
 
-if len(args) < 6:
+if len(args) < 7:
     print("[Foton] render_setup.py: not enough args, skipping setup")
 else:
     res_x = int(args[0])
@@ -136,6 +137,7 @@ else:
     engine = args[3]
     fmt = args[4]
     output_path = args[5]
+    max_samples = int(args[6])
 
     scene = bpy.context.scene
 
@@ -152,6 +154,13 @@ else:
     if engine:
         scene.render.engine = engine
 
+    # Max samples
+    if max_samples > 0:
+        if engine == "CYCLES":
+            scene.cycles.samples = max_samples
+        elif engine in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"):
+            scene.eevee.taa_render_samples = max_samples
+
     # Output format & path
     scene.render.image_settings.file_format = fmt
     scene.render.filepath = output_path
@@ -167,7 +176,7 @@ else:
             device.use = True
         print(f"[Foton] GPU devices: {[d.name for d in prefs.devices if d.use]}")
 
-    print(f"[Foton] Scene setup: {res_x}x{res_y}, camera={camera_name}, engine={engine}, format={fmt}")
+    print(f"[Foton] Scene setup: {res_x}x{res_y}, camera={camera_name}, engine={engine}, format={fmt}, samples={max_samples}")
 PYEOF
 
 echo "[Foton] Render setup script created."
@@ -188,18 +197,18 @@ FAILED_FRAME=""
 
 for FRAME in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
   PADDED=$(printf "%04d" "$FRAME")
-  OUTPUT_PREFIX="/root/output/${OUTPUT_NAMING}_####"
+  OUTPUT_PREFIX="/root/output/${OUTPUT_NAMING}_"
   EXPECTED_FILE="/root/output/${OUTPUT_NAMING}_${PADDED}.${FILE_EXT}"
 
   echo "──────────────────────────────────────────"
   echo "[Foton] Rendering frame ${FRAME} / ${FRAME_END}..."
 
-  # Render single frame
+  # Render single frame — filepath set to prefix, Blender appends frame number
   /opt/blender/blender -b /root/scene.blend \
     -P /opt/blender/activate_gpu.py \
     -P /root/render_setup.py \
     -f "$FRAME" \
-    -- "$RES_X" "$RES_Y" "$CAMERA" "$RENDER_ENGINE" "$BLENDER_FORMAT" "$OUTPUT_PREFIX"
+    -- "$RES_X" "$RES_Y" "$CAMERA" "$RENDER_ENGINE" "$BLENDER_FORMAT" "$OUTPUT_PREFIX" "$MAX_SAMPLES"
 
   BLENDER_EXIT=$?
 
@@ -219,7 +228,7 @@ for FRAME in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
     -H "Content-Type: application/json" \
     -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"frameNumber\": ${FRAME}}")
 
-  UPLOAD_URL=$(echo "$UPLOAD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadUrl',''))" 2>/dev/null)
+  UPLOAD_URL=$(echo "$UPLOAD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadUrl') or '')" 2>/dev/null)
 
   if [ -z "$UPLOAD_URL" ]; then
     echo "[Foton] ERROR: Failed to get upload URL for frame ${FRAME}"
@@ -265,8 +274,17 @@ else
   FINAL_STATUS="completed"
 fi
 
-curl -s -X POST "${FOTON_API_URL}/instances/report" \
-  -H "Content-Type: application/json" \
-  -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"${FINAL_STATUS}\"}"
+# Retry final report up to 3 times to ensure status is updated and instance is destroyed
+for ATTEMPT in 1 2 3; do
+  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${FOTON_API_URL}/instances/report" \
+    -H "Content-Type: application/json" \
+    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"${FINAL_STATUS}\"}")
 
-echo "[Foton] Reported status: ${FINAL_STATUS}. Instance will be destroyed by API."
+  if [ "$HTTP_STATUS" = "200" ]; then
+    echo "[Foton] Reported status: ${FINAL_STATUS}. Instance will be destroyed by API."
+    break
+  else
+    echo "[Foton] WARNING: Final report attempt ${ATTEMPT} failed (HTTP ${HTTP_STATUS})"
+    sleep 5
+  fi
+done
