@@ -37,6 +37,13 @@ wget -q -O /opt/blender/activate_gpu.py https://raw.githubusercontent.com/aaryan
 mkdir -p /var/run/sshd
 service ssh start
 
+if [ -n "$FOTON_API_URL" ]; then         
+      curl -s -X POST "${FOTON_API_URL}/instances/report" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"ready\"}"
+      echo "[Foton] Reported ready to Foton API."
+fi
+
 # 6. MARKER: DONE
 # We remove the 'installing' flag and create 'ready'.
 # Your Desktop App will look for this file to know it can start uploading.
