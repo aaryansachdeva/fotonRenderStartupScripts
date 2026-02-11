@@ -38,7 +38,7 @@ if [ -n "$FOTON_API_URL" ]; then
       RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/heartbeat" \
         -H "Content-Type: application/json" \
         -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}")
-      ACTION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action',''))" 2>/dev/null)
+      ACTION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action') or '')" 2>/dev/null)
       if [ "$ACTION" = "shutdown" ]; then
           echo "[Foton] Shutdown signal received. Exiting."
           exit 0
@@ -57,14 +57,14 @@ if [ -n "$FOTON_API_URL" ]; then
   echo "[Foton] Reported ready to API."
 
   # Extract blend download URL from response
-  BLEND_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl',''))" 2>/dev/null)
+  BLEND_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
 
   # If upload isn't done yet, poll until it is
   while [ -z "$BLEND_URL" ]; do
       echo "[Foton] Waiting for blend file upload..."
       sleep 5
       BLEND_URL=$(curl -s "${FOTON_API_URL}/instances/blend-url?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}" \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl',''))" 2>/dev/null)
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
   done
 
   echo "[Foton] Downloading blend file..."
