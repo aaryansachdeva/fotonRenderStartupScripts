@@ -7,46 +7,39 @@
 # Blender renders all frames natively via the -a flag (zero overhead).
 # A parallel watcher loop detects completed frames on disk, uploads
 # them to R2, reports progress, and handles cancellation.
-#
-# Old approach: bash for-loop launched Blender N times (once per frame).
-#   → Paid full startup cost (load scene, compile shaders, build BVH) N times.
-#
-# New approach: Blender launches ONCE, renders the full animation.
-#   → Startup cost paid once. Watcher uploads frames as they finish.
 # ═══════════════════════════════════════════════════════════════
 
-# ── 1. PROVISIONING ──────────────────────────────────────────
+# Helper: report status to Foton API
+report_status() {
+  local STATUS="$1"
+  local EXTRA="$2"
+  if [ -n "$FOTON_API_URL" ]; then
+    curl -s -X POST "${FOTON_API_URL}/instances/report" \
+      -H "Content-Type: application/json" \
+      -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"${STATUS}\"${EXTRA:+, $EXTRA}}" > /dev/null
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 1. IGNITING THRUSTERS (Booting Up)
+# ═══════════════════════════════════════════════════════════════
 
 touch /root/installing
-echo "[Foton] Starting Provisioning..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "⚡ IGNITING THRUSTERS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "[Foton] Instance booted. Task: ${FOTON_TASK_ID}"
 
-# Install system dependencies
-apt-get update -qq
-apt-get install -y -qq wget xz-utils libgl1 libxrandr2 libxinerama1 \
-  libxcursor1 libxi6 libxxf86vm1 libsm6 libxext6 openssh-server python3 curl
+# Report booting immediately so the app knows we're alive
+report_status "booting"
+echo "[Foton] Status → booting"
 
-# Install Blender 5.0.1
-if [ ! -d "/opt/blender" ]; then
-  echo "[Foton] Downloading Blender 5.0.1..."
-  wget -q https://download.blender.org/release/Blender5.0/blender-5.0.1-linux-x64.tar.xz
-
-  echo "[Foton] Extracting..."
-  tar -xf blender-5.0.1-linux-x64.tar.xz
-  mv blender-5.0.1-linux-x64 /opt/blender
-  rm blender-5.0.1-linux-x64.tar.xz
-else
-  echo "[Foton] Blender already installed. Skipping download."
-fi
-
-# Download GPU activation script
-echo "[Foton] Fetching GPU activation script..."
-wget -q -O /opt/blender/activate_gpu.py https://raw.githubusercontent.com/aaryansachdeva/fotonRenderStartupScripts/refs/heads/main/activate_gpu.py
-
-# SSH
+# Start SSH
 mkdir -p /var/run/sshd
 service ssh start
+echo "[Foton] SSH service started."
 
-# ── 1b. LOG SERVER (serves provisioning + blender logs over HTTP) ──
+# ── Log Server (serves provisioning + blender logs over HTTP) ──
 
 cat > /root/log_server.py << 'PYEOF'
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -80,14 +73,20 @@ PYEOF
 
 python3 /root/log_server.py &
 LOG_SERVER_PID=$!
-echo "[Foton] Log server started on port 8081 (PID: $LOG_SERVER_PID)"
 
 # Compute public log URL from Vast.ai env vars
 EXTERNAL_PORT=${VAST_TCP_PORT_8081:-8081}
 LOG_BASE_URL="http://${PUBLIC_IPADDR}:${EXTERNAL_PORT}"
-echo "[Foton] Log URL: ${LOG_BASE_URL}"
+echo "[Foton] Log server started → ${LOG_BASE_URL}"
 
-# ── 2. HEARTBEAT (background keep-alive ping) ────────────────
+# Report log URL so the app can start showing logs immediately
+if [ -n "$FOTON_API_URL" ]; then
+  curl -s -X POST "${FOTON_API_URL}/instances/report" \
+    -H "Content-Type: application/json" \
+    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"logBaseUrl\": \"${LOG_BASE_URL}\"}" > /dev/null
+fi
+
+# ── Heartbeat (background keep-alive ping) ──
 
 if [ -n "$FOTON_API_URL" ]; then
   (while true; do
@@ -97,42 +96,93 @@ if [ -n "$FOTON_API_URL" ]; then
       sleep 30
   done) &
   HEARTBEAT_PID=$!
-  echo "[Foton] Heartbeat started (PID: $HEARTBEAT_PID)."
+  echo "[Foton] Heartbeat active."
 fi
 
-# ── 3. REPORT READY & DOWNLOAD BLEND FILE ────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 2. ONBOARDING SYSTEMS (Downloading Software)
+# ═══════════════════════════════════════════════════════════════
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔧 ONBOARDING SYSTEMS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+report_status "downloading_software"
+echo "[Foton] Status → downloading_software"
+
+echo "[Foton] Installing system dependencies..."
+apt-get update -qq
+apt-get install -y -qq wget xz-utils libgl1 libxrandr2 libxinerama1 \
+  libxcursor1 libxi6 libxxf86vm1 libsm6 libxext6 openssh-server python3 curl
+echo "[Foton] System dependencies installed."
+
+if [ ! -d "/opt/blender" ]; then
+  echo "[Foton] Downloading Blender 5.0.1..."
+  wget -q --show-progress https://download.blender.org/release/Blender5.0/blender-5.0.1-linux-x64.tar.xz 2>&1 | \
+    while IFS= read -r line; do echo "[Foton] $line"; done
+
+  echo "[Foton] Extracting Blender..."
+  tar -xf blender-5.0.1-linux-x64.tar.xz
+  mv blender-5.0.1-linux-x64 /opt/blender
+  rm blender-5.0.1-linux-x64.tar.xz
+  echo "[Foton] Blender 5.0.1 installed."
+else
+  echo "[Foton] Blender already installed. Skipping download."
+fi
+
+echo "[Foton] Fetching GPU activation script..."
+wget -q -O /opt/blender/activate_gpu.py https://raw.githubusercontent.com/aaryansachdeva/fotonRenderStartupScripts/refs/heads/main/activate_gpu.py
+echo "[Foton] GPU activation script ready."
+
+echo "[Foton] All systems onboarded."
+
+# ═══════════════════════════════════════════════════════════════
+# 3. ACCESSING IMPERIAL BLUEPRINTS (Downloading Project Files)
+# ═══════════════════════════════════════════════════════════════
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📦 ACCESSING IMPERIAL BLUEPRINTS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+report_status "downloading"
+echo "[Foton] Status → downloading"
 
 if [ -n "$FOTON_API_URL" ]; then
+  # Get blend download URL
   RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
-    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"ready\", \"logBaseUrl\": \"${LOG_BASE_URL}\"}")
-  echo "[Foton] Reported ready to API."
+    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"blendDownloaded\": false}")
 
-  # Extract blend download URL from response
   BLEND_URL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
 
   # If upload isn't done yet, poll until it is
+  POLL_COUNT=0
   while [ -z "$BLEND_URL" ]; do
-      echo "[Foton] Waiting for blend file upload..."
+      POLL_COUNT=$(( POLL_COUNT + 1 ))
+      echo "[Foton] Waiting for project file upload... (attempt ${POLL_COUNT})"
       sleep 5
       BLEND_URL=$(curl -s "${FOTON_API_URL}/instances/blend-url?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
   done
 
-  echo "[Foton] Downloading blend file..."
-  curl -s -o /root/scene.blend "$BLEND_URL"
+  echo "[Foton] Downloading project file..."
+  curl -# -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+
+  BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
+  echo "[Foton] Project file downloaded (${BLEND_SIZE})."
 
   # Report blend downloaded
   curl -s -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
-    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"blendDownloaded\": true}"
-  echo "[Foton] Blend file ready."
+    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"blendDownloaded\": true}" > /dev/null
+  echo "[Foton] Imperial blueprints secured."
 fi
 
-# Provisioning done
 rm /root/installing
 touch /root/ready
-echo "[Foton] Node Fully Provisioned & Ready."
+echo "[Foton] Node fully provisioned and ready."
 
 # ═══════════════════════════════════════════════════════════════
 # 4. FETCH RENDER CONFIG
@@ -143,6 +193,7 @@ if [ -z "$FOTON_API_URL" ]; then
   exit 0
 fi
 
+echo ""
 echo "[Foton] Fetching render config..."
 CONFIG=$(curl -s "${FOTON_API_URL}/instances/render-config?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}")
 
@@ -161,7 +212,6 @@ echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${
 
 # Map file extension to Blender format string
 # Also normalize FILE_EXT to match what Blender actually writes on disk
-# (e.g. Blender saves JPEG as .jpg, TIFF as .tif)
 case "$FILE_EXT" in
   exr)      export BLENDER_FORMAT="OPEN_EXR" ;;
   png)      export BLENDER_FORMAT="PNG" ;;
@@ -173,9 +223,6 @@ esac
 # ═══════════════════════════════════════════════════════════════
 # 5. CREATE SCENE SETUP SCRIPT
 # ═══════════════════════════════════════════════════════════════
-# This script configures Blender's scene settings (resolution, camera,
-# engine, samples, frame range, output format) then exits.
-# Blender's -a flag takes over and renders the full animation natively.
 
 mkdir -p /root/output
 
@@ -231,7 +278,6 @@ if SAMPLES > 0:
         scene.eevee.taa_render_samples = SAMPLES
 
 # Output format and filepath
-# Blender's -a flag appends the frame number (4-digit padded) to this prefix
 scene.render.image_settings.file_format = FILE_FORMAT
 scene.render.filepath = f"/root/output/{OUTPUT_NAMING}_"
 scene.render.use_file_extension = True
@@ -242,23 +288,20 @@ PYEOF
 echo "[Foton] Render setup script created."
 
 # ═══════════════════════════════════════════════════════════════
-# 6. TRANSITION TO RENDERING
+# 6. RENDERING
 # ═══════════════════════════════════════════════════════════════
 
-curl -s -X POST "${FOTON_API_URL}/instances/report" \
-  -H "Content-Type: application/json" \
-  -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"rendering\"}"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🎬 RENDERING"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+report_status "rendering"
 echo "[Foton] Status → rendering"
 
 # ═══════════════════════════════════════════════════════════════
 # 7. LAUNCH BLENDER (background) + WATCHDOG LOOP (foreground)
 # ═══════════════════════════════════════════════════════════════
-# Blender renders all frames natively with -a.
-# The watcher detects completed files and uploads them in parallel.
-#
-# Safe-gap rule: a frame file is only uploaded once the NEXT frame's
-# file also exists on disk (proving the current one is fully written).
-# The final frame is uploaded after Blender exits.
 
 BLENDER_LOG="/root/blender.log"
 > "$BLENDER_LOG"
@@ -268,7 +311,7 @@ BLENDER_LOG="/root/blender.log"
   -P /root/render_setup.py \
   -a > "$BLENDER_LOG" 2>&1 &
 BLENDER_PID=$!
-echo "[Foton] Blender started (PID: $BLENDER_PID), logging to $BLENDER_LOG"
+echo "[Foton] Blender launched (PID: $BLENDER_PID)"
 
 # Build ordered list of expected frame numbers
 EXPECTED_FRAMES=()
@@ -308,10 +351,8 @@ while true; do
     # Safe-gap check: only upload if next frame also exists OR Blender has exited
     SAFE=false
     if [ "$BLENDER_ALIVE" = false ]; then
-      # Blender is done — all existing files are fully written
       SAFE=true
     elif [ $(( NEXT + 1 )) -lt "$TOTAL" ]; then
-      # Check if the next expected frame file exists
       NF=${EXPECTED_FRAMES[$(( NEXT + 1 ))]}
       NP=$(printf "%04d" "$NF")
       [ -f "/root/output/${OUTPUT_NAMING}_${NP}.${FILE_EXT}" ] && SAFE=true
@@ -363,16 +404,12 @@ while true; do
     fi
 
     # ── Parse Blender's render time from log ──
-    # Blender prints: " Time: 00:19.10 (Saving: 00:00.07)" after each frame.
-    # We read new log lines since last check and find the Time line for this frame.
     RENDER_TIME=""
     NEW_LOG=$(tail -c +$(( LOG_OFFSET + 1 )) "$BLENDER_LOG" 2>/dev/null)
     LOG_OFFSET=$(wc -c < "$BLENDER_LOG")
 
-    # Extract the last "Time:" line from new log chunk (corresponds to this frame)
     TIME_LINE=$(echo "$NEW_LOG" | grep -oP 'Time:\s+\K[0-9]+:[0-9]+\.[0-9]+' | tail -1)
     if [ -n "$TIME_LINE" ]; then
-      # Parse MM:SS.ms → seconds
       MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
       SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
       RENDER_TIME=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
@@ -397,13 +434,11 @@ while true; do
 
   # ── Exit conditions ──
 
-  # All frames uploaded — success
   if [ "$NEXT" -ge "$TOTAL" ]; then
     echo "[Foton] All ${TOTAL} frames uploaded."
     break
   fi
 
-  # Blender exited but frames are missing — failure
   if [ "$BLENDER_ALIVE" = false ]; then
     if [ "$BLENDER_EXIT" -ne 0 ]; then
       echo "[Foton] Blender crashed (exit code ${BLENDER_EXIT}). ${NEXT}/${TOTAL} frames uploaded."
@@ -433,18 +468,18 @@ while true; do
   sleep 2
 done
 
-# Kill background heartbeat
+# Kill background processes
 kill "$HEARTBEAT_PID" 2>/dev/null
+kill "$LOG_SERVER_PID" 2>/dev/null
 
-echo "══════════════════════════════════════════"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # ═══════════════════════════════════════════════════════════════
 # 8. REPORT FINAL STATUS
 # ═══════════════════════════════════════════════════════════════
 
 if [ "$CANCELLED" = true ]; then
-  # Task status is already 'cancelled' (set by the client).
-  # No report needed — just exit cleanly.
   echo "[Foton] Task was cancelled. Exiting."
   exit 0
 fi
@@ -457,7 +492,6 @@ fi
 
 echo "[Foton] Reporting: ${FINAL_STATUS}"
 
-# Retry final report up to 3 times to ensure the API receives it
 for ATTEMPT in 1 2 3; do
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
