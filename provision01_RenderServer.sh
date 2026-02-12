@@ -14,7 +14,7 @@ report_status() {
   local STATUS="$1"
   local EXTRA="$2"
   if [ -n "$FOTON_API_URL" ]; then
-    curl -s -X POST "${FOTON_API_URL}/instances/report" \
+    curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/report" \
       -H "Content-Type: application/json" \
       -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"${STATUS}\"${EXTRA:+, $EXTRA}}" > /dev/null
   fi
@@ -81,7 +81,7 @@ echo "[Foton] Log server started → ${LOG_BASE_URL}"
 
 # Report log URL so the app can start showing logs immediately
 if [ -n "$FOTON_API_URL" ]; then
-  curl -s -X POST "${FOTON_API_URL}/instances/report" \
+  curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
     -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"logBaseUrl\": \"${LOG_BASE_URL}\"}" > /dev/null
 fi
@@ -90,7 +90,7 @@ fi
 
 if [ -n "$FOTON_API_URL" ]; then
   (while true; do
-      curl -s -X POST "${FOTON_API_URL}/instances/heartbeat" \
+      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/heartbeat" \
         -H "Content-Type: application/json" \
         -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" > /dev/null
       sleep 30
@@ -151,7 +151,7 @@ echo "[Foton] Status → downloading"
 
 if [ -n "$FOTON_API_URL" ]; then
   # Get blend download URL
-  RESPONSE=$(curl -s -X POST "${FOTON_API_URL}/instances/report" \
+  RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
     -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"blendDownloaded\": false}")
 
@@ -163,18 +163,18 @@ if [ -n "$FOTON_API_URL" ]; then
       POLL_COUNT=$(( POLL_COUNT + 1 ))
       echo "[Foton] Waiting for project file upload... (attempt ${POLL_COUNT})"
       sleep 5
-      BLEND_URL=$(curl -s "${FOTON_API_URL}/instances/blend-url?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}" \
+      BLEND_URL=$(curl -s --connect-timeout 10 --max-time 30 "${FOTON_API_URL}/instances/blend-url?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
   done
 
   echo "[Foton] Downloading project file..."
-  curl -# -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+  curl -# --connect-timeout 15 --max-time 600 -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
 
   BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
   echo "[Foton] Project file downloaded (${BLEND_SIZE})."
 
   # Report blend downloaded
-  curl -s -X POST "${FOTON_API_URL}/instances/report" \
+  curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
     -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"blendDownloaded\": true}" > /dev/null
   echo "[Foton] Imperial blueprints secured."
@@ -362,7 +362,7 @@ while true; do
     # ── Get presigned upload URL (with retry) ──
     UPLOAD_URL=""
     for RETRY in 1 2 3; do
-      UPLOAD_URL=$(curl -s -X POST "${FOTON_API_URL}/instances/frame-upload-url" \
+      UPLOAD_URL=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/frame-upload-url" \
         -H "Content-Type: application/json" \
         -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"frameNumber\": ${FRAME}}" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadUrl') or '')" 2>/dev/null)
@@ -383,7 +383,7 @@ while true; do
     # ── Upload file to R2 (with retry) ──
     UPLOAD_OK=false
     for RETRY in 1 2 3; do
-      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
+      HTTP_CODE=$(curl -s --connect-timeout 10 --max-time 120 -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
         -H "Content-Type: application/octet-stream" \
         --data-binary "@${FILE}")
       if [ "$HTTP_CODE" = "200" ]; then
@@ -417,11 +417,11 @@ while true; do
 
     # ── Report progress ──
     if [ -n "$RENDER_TIME" ]; then
-      curl -s -X POST "${FOTON_API_URL}/instances/progress" \
+      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
         -H "Content-Type: application/json" \
         -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}, \"renderTime\": ${RENDER_TIME}}" > /dev/null
     else
-      curl -s -X POST "${FOTON_API_URL}/instances/progress" \
+      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
         -H "Content-Type: application/json" \
         -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}" > /dev/null
     fi
@@ -452,7 +452,7 @@ while true; do
   HB_TICK=$(( HB_TICK + 1 ))
   if [ "$HB_TICK" -ge 15 ]; then
     HB_TICK=0
-    HB_ACTION=$(curl -s -X POST "${FOTON_API_URL}/instances/heartbeat" \
+    HB_ACTION=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/heartbeat" \
       -H "Content-Type: application/json" \
       -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" \
       | python3 -c "import sys,json; print(json.load(sys.stdin).get('action') or '')" 2>/dev/null)
@@ -493,7 +493,7 @@ fi
 echo "[Foton] Reporting: ${FINAL_STATUS}"
 
 for ATTEMPT in 1 2 3; do
-  HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${FOTON_API_URL}/instances/report" \
+  HTTP_STATUS=$(curl -s --connect-timeout 10 --max-time 30 -o /dev/null -w "%{http_code}" -X POST "${FOTON_API_URL}/instances/report" \
     -H "Content-Type: application/json" \
     -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"${FINAL_STATUS}\"}")
 
