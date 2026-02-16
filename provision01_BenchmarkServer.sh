@@ -139,15 +139,20 @@ while true; do
   echo "[Benchmark] Blend downloaded (${BLEND_SIZE})"
 
   # ═══════════════════════════════════════════════════════════════
-  # SINGLE-PASS at 20 samples — fast benchmark, linear extrapolation
+  # TWO-PASS BENCHMARK — isolate per-sample cost
   #
-  # Renders 3 frames (first, mid, last) at 20 samples using -a flag.
-  # Warmup frame pre-compiles GPU kernels first.
+  # Pass 1: 3 frames at 1 sample  (captures BVH, denoising, overhead)
+  # Pass 2: 3 frames at 20 samples (captures overhead + 19 extra samples)
+  #
+  # per_sample = (t20 - t1) / 19  — denoising/BVH cancel out in the diff
+  #
+  # Frontend extrapolation:
+  #   frame_time = frame_at_20 + per_sample × (userSamples - 20)
   #
   # Reports:
-  #   initTime      = first frame time (includes BVH/kernel cold start)
-  #   perSampleTime = avg warm frame time (mid + last / 2)
-  #   renderTime    = avg of all 3 frames
+  #   initTime      = first frame at 20 samples (cold)
+  #   perSampleTime = avg per-sample time (from warm frame diffs)
+  #   renderTime    = avg warm frame at 20 samples
   # ═══════════════════════════════════════════════════════════════
 
   # ── Create render setup script ──
@@ -197,13 +202,9 @@ PYEOF
   export BENCH_CAMERA="$CAMERA"
   export BENCH_ENGINE="$ENGINE"
   export BENCH_OUTPUT="${WORK_DIR}/output/bench_"
-  export BENCH_SAMPLES="$SAMPLES"
 
   # ── Warmup: render 1 frame at 1 sample to compile GPU kernels ──
   echo "[Benchmark] Warmup: compiling render kernels..."
-  SAVE_SAMPLES="$BENCH_SAMPLES"
-  SAVE_FRAME_END="$BENCH_FRAME_END"
-  SAVE_FRAME_STEP="$BENCH_FRAME_STEP"
   export BENCH_SAMPLES=1
   export BENCH_FRAME_END="$FRAME_START"
   export BENCH_FRAME_STEP=1
@@ -216,71 +217,113 @@ PYEOF
   echo "[Benchmark] Warmup complete — kernels cached."
   rm -f "${WORK_DIR}"/output/bench_*.png
 
-  # Restore actual values
-  export BENCH_SAMPLES="$SAVE_SAMPLES"
-  export BENCH_FRAME_END="$SAVE_FRAME_END"
-  export BENCH_FRAME_STEP="$SAVE_FRAME_STEP"
+  # Restore actual frame range
+  export BENCH_FRAME_END="$FRAME_END"
+  export BENCH_FRAME_STEP="$FRAME_STEP"
 
-  # ── Render 3 frames at 20 samples ──
-  echo "[Benchmark] Rendering ${FRAME_COUNT} frames at ${SAMPLES} samples..."
-  BENCH_LOG="${WORK_DIR}/blender_bench.log"
+  # ── Pass 1: Render 3 frames at 1 sample ──
+  echo "[Benchmark] Pass 1: Rendering ${FRAME_COUNT} frames at 1 sample..."
+  LOG_1="${WORK_DIR}/blender_1.log"
+  export BENCH_SAMPLES=1
 
   /opt/blender/blender -b "$BLEND_PATH" \
     -P /opt/blender/activate_gpu.py \
     -P "${WORK_DIR}/bench_setup.py" \
-    -a > "$BENCH_LOG" 2>&1
+    -a > "$LOG_1" 2>&1
 
-  EXIT_CODE=$?
-  echo "[Benchmark] Render complete (exit $EXIT_CODE)"
+  EXIT_1=$?
+  echo "[Benchmark] Pass 1 complete (exit $EXIT_1)"
 
-  # Parse per-frame times from log: "Time: MM:SS.FF"
-  FRAME_TIMES=()
+  TIMES_1=()
   while IFS= read -r line; do
     SECS=$(parse_blender_time "$line")
-    FRAME_TIMES+=("$SECS")
-  done < <(grep -oP 'Time:\s*\K[0-9]+:[0-9]+\.[0-9]+' "$BENCH_LOG")
+    TIMES_1+=("$SECS")
+  done < <(grep -oP 'Time:\s*\K[0-9]+:[0-9]+\.[0-9]+' "$LOG_1")
+  echo "[Benchmark] Pass 1 frame times: ${TIMES_1[*]}"
 
-  echo "[Benchmark] Frame times: ${FRAME_TIMES[*]}"
+  # Clean output from pass 1
+  rm -f "${WORK_DIR}"/output/bench_*.png
 
-  FRAME_COUNT_ACTUAL=${#FRAME_TIMES[@]}
+  # ── Pass 2: Render 3 frames at 20 samples ──
+  echo "[Benchmark] Pass 2: Rendering ${FRAME_COUNT} frames at ${SAMPLES} samples..."
+  LOG_20="${WORK_DIR}/blender_20.log"
+  export BENCH_SAMPLES="$SAMPLES"
 
-  if [ "$FRAME_COUNT_ACTUAL" -gt 0 ]; then
-    # First frame = cold (includes BVH build + scene sync overhead)
-    FIRST_FRAME=${FRAME_TIMES[0]}
-    echo "[Benchmark] First frame (cold): ${FIRST_FRAME}s"
+  /opt/blender/blender -b "$BLEND_PATH" \
+    -P /opt/blender/activate_gpu.py \
+    -P "${WORK_DIR}/bench_setup.py" \
+    -a > "$LOG_20" 2>&1
 
-    # Avg warm frames = mid + last (skip first)
-    if [ "$FRAME_COUNT_ACTUAL" -ge 3 ]; then
-      AVG_WARM=$(echo "${FRAME_TIMES[1]} ${FRAME_TIMES[2]}" | awk '{printf "%.4f", ($1 + $2) / 2}')
-    elif [ "$FRAME_COUNT_ACTUAL" -ge 2 ]; then
-      AVG_WARM=${FRAME_TIMES[1]}
+  EXIT_20=$?
+  echo "[Benchmark] Pass 2 complete (exit $EXIT_20)"
+
+  TIMES_20=()
+  while IFS= read -r line; do
+    SECS=$(parse_blender_time "$line")
+    TIMES_20+=("$SECS")
+  done < <(grep -oP 'Time:\s*\K[0-9]+:[0-9]+\.[0-9]+' "$LOG_20")
+  echo "[Benchmark] Pass 2 frame times: ${TIMES_20[*]}"
+
+  # ── Calculate per-sample time from warm frame diffs ──
+  COUNT_1=${#TIMES_1[@]}
+  COUNT_20=${#TIMES_20[@]}
+  PAIR_COUNT=$((COUNT_1 < COUNT_20 ? COUNT_1 : COUNT_20))
+
+  if [ "$PAIR_COUNT" -gt 0 ]; then
+    # First frame at 20 samples (cold)
+    FIRST_FRAME_20=${TIMES_20[0]}
+    echo "[Benchmark] First frame at 20 smp: ${FIRST_FRAME_20}s"
+
+    # Compute per-sample from warm frames (skip first frame)
+    if [ "$PAIR_COUNT" -ge 3 ]; then
+      # Use mid + last frame diffs
+      PER_SAMPLE=$(echo "${TIMES_1[1]} ${TIMES_20[1]} ${TIMES_1[2]} ${TIMES_20[2]}" | awk '{
+        diff1 = $2 - $1
+        diff2 = $4 - $3
+        avg_diff = (diff1 + diff2) / 2
+        ps = avg_diff / 19
+        if (ps < 0) ps = 0
+        printf "%.6f", ps
+      }')
+      AVG_WARM_20=$(echo "${TIMES_20[1]} ${TIMES_20[2]}" | awk '{printf "%.4f", ($1 + $2) / 2}')
+    elif [ "$PAIR_COUNT" -ge 2 ]; then
+      PER_SAMPLE=$(echo "${TIMES_1[1]} ${TIMES_20[1]}" | awk '{
+        ps = ($2 - $1) / 19
+        if (ps < 0) ps = 0
+        printf "%.6f", ps
+      }')
+      AVG_WARM_20=${TIMES_20[1]}
     else
-      AVG_WARM=$FIRST_FRAME
+      # Only 1 frame — use first frame diff
+      PER_SAMPLE=$(echo "${TIMES_1[0]} ${TIMES_20[0]}" | awk '{
+        ps = ($2 - $1) / 19
+        if (ps < 0) ps = 0
+        printf "%.6f", ps
+      }')
+      AVG_WARM_20=$FIRST_FRAME_20
     fi
-    echo "[Benchmark] Avg warm frame: ${AVG_WARM}s"
 
-    # Overall average for display
-    SUM_TOTAL=0
-    for i in $(seq 0 $((FRAME_COUNT_ACTUAL - 1))); do
-      T=${FRAME_TIMES[$i]}
-      echo "[Benchmark] Frame $((i+1)): ${T}s"
-      SUM_TOTAL=$(echo "$SUM_TOTAL $T" | awk '{printf "%.6f", $1 + $2}')
-    done
-    AVG_TOTAL=$(echo "$SUM_TOTAL $FRAME_COUNT_ACTUAL" | awk '{printf "%.4f", $1 / $2}')
+    echo "[Benchmark] Avg warm frame at 20 smp: ${AVG_WARM_20}s"
+    echo "[Benchmark] Per-sample time: ${PER_SAMPLE}s"
 
-    # Parse peak VRAM from Blender log (Mem: XXM)
-    PEAK_VRAM=$(grep -oP 'Mem:\s*\K[0-9]+' "$BENCH_LOG" | sort -n | tail -1)
+    # Parse peak VRAM from Pass 2 log (Mem: XXM)
+    PEAK_VRAM=$(grep -oP 'Mem:\s*\K[0-9]+' "$LOG_20" | sort -n | tail -1)
     PEAK_VRAM=${PEAK_VRAM:-0}
 
-    echo ""
-    echo "[Benchmark] ── Results (${FRAME_COUNT_ACTUAL} frames at ${SAMPLES} samples) ──"
-    echo "[Benchmark] First frame:     ${FIRST_FRAME}s"
-    echo "[Benchmark] Avg warm frame:  ${AVG_WARM}s"
-    echo "[Benchmark] Overall average: ${AVG_TOTAL}s"
-    echo "[Benchmark] Peak VRAM:       ${PEAK_VRAM}M"
+    # Log all frame details
+    for i in $(seq 0 $((PAIR_COUNT - 1))); do
+      echo "[Benchmark] Frame $((i+1)): t1=${TIMES_1[$i]}s, t20=${TIMES_20[$i]}s"
+    done
 
-    # initTime = first frame, perSampleTime = avg warm frame, renderTime = overall avg
-    PAYLOAD="{\"token\": \"${BENCHMARK_TOKEN}\", \"jobId\": \"${JOB_ID}\", \"renderTime\": ${AVG_TOTAL}, \"initTime\": ${FIRST_FRAME}, \"perSampleTime\": ${AVG_WARM}, \"gpuName\": \"${GPU_NAME}\", \"peakVram\": ${PEAK_VRAM}}"
+    echo ""
+    echo "[Benchmark] ── Results ──"
+    echo "[Benchmark] First frame (20 smp): ${FIRST_FRAME_20}s"
+    echo "[Benchmark] Avg warm (20 smp):    ${AVG_WARM_20}s"
+    echo "[Benchmark] Per-sample time:      ${PER_SAMPLE}s"
+    echo "[Benchmark] Peak VRAM:            ${PEAK_VRAM}M"
+
+    # initTime = first frame @20, perSampleTime = per-sample, renderTime = avg warm @20
+    PAYLOAD="{\"token\": \"${BENCHMARK_TOKEN}\", \"jobId\": \"${JOB_ID}\", \"renderTime\": ${AVG_WARM_20}, \"initTime\": ${FIRST_FRAME_20}, \"perSampleTime\": ${PER_SAMPLE}, \"gpuName\": \"${GPU_NAME}\", \"peakVram\": ${PEAK_VRAM}}"
 
     curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/benchmark/result" \
       -H "Content-Type: application/json" \
@@ -290,7 +333,7 @@ PYEOF
   else
     echo "[Benchmark] ERROR: Failed to parse frame times from Blender logs"
 
-    ERROR_CONTEXT="Exit:${EXIT_CODE}. Log tail: $(tail -c 500 "$BENCH_LOG" 2>/dev/null)"
+    ERROR_CONTEXT="Pass1 exit:${EXIT_1}, Pass2 exit:${EXIT_20}. Times1:[${TIMES_1[*]}] Times20:[${TIMES_20[*]}]"
     ERROR_JSON=$(echo "$ERROR_CONTEXT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))" 2>/dev/null || echo "\"Failed to parse frame times\"")
 
     curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/benchmark/result" \
