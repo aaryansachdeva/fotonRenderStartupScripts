@@ -200,6 +200,24 @@ PYEOF
   export BENCH_ENGINE="$ENGINE"
   export BENCH_OUTPUT="${WORK_DIR}/output/bench_"
 
+  # ── Warmup: render 1 frame at 1 sample to compile GPU kernels ──
+  echo "[Benchmark] Warmup: compiling render kernels..."
+  export BENCH_SAMPLES=1
+  export BENCH_FRAME_END="$FRAME_START"
+  export BENCH_FRAME_STEP=1
+
+  /opt/blender/blender -b "$BLEND_PATH" \
+    -P /opt/blender/activate_gpu.py \
+    -P "${WORK_DIR}/bench_setup.py" \
+    -a > /dev/null 2>&1
+
+  echo "[Benchmark] Warmup complete — kernels cached."
+  rm -f "${WORK_DIR}"/output/bench_*.png
+
+  # Restore actual frame range
+  export BENCH_FRAME_END="$FRAME_END"
+  export BENCH_FRAME_STEP="$FRAME_STEP"
+
   # ── Pass 1: Render at 1 sample ──
   echo "[Benchmark] Pass 1: Rendering ${FRAME_COUNT} frames at 1 sample (calibration)..."
   LOG_1="${WORK_DIR}/blender_1.log"
