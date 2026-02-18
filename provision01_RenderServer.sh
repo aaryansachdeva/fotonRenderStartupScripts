@@ -90,10 +90,10 @@ fi
 
 if [ -n "$FOTON_API_URL" ]; then
   (while true; do
-      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/heartbeat" \
+      curl -s --connect-timeout 5 --max-time 15 -X POST "${FOTON_API_URL}/instances/heartbeat" \
         -H "Content-Type: application/json" \
         -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" > /dev/null
-      sleep 30
+      sleep 20
   done) &
   HEARTBEAT_PID=$!
   echo "[Foton] Heartbeat active."
@@ -207,6 +207,23 @@ export RENDER_ENGINE=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.
 export FILE_EXT=$(echo "$CONFIG"     | python3 -c "import sys,json; print(json.load(sys.stdin)['fileExtension'])")
 export OUTPUT_NAMING=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputFileNaming'])")
 export MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['maxSamples'])")
+
+# ── Skip completed frames on recovery ──
+COMPLETED_MAX=$(echo "$CONFIG" | python3 -c "
+import sys,json
+cf = json.load(sys.stdin).get('completedFrames', [])
+print(max(cf) if cf else '')
+" 2>/dev/null)
+
+if [ -n "$COMPLETED_MAX" ]; then
+  FRAME_START=$(( COMPLETED_MAX + FRAME_INC ))
+  echo "[Foton] Resuming from frame ${FRAME_START} (skipping completed frames, max was ${COMPLETED_MAX})"
+  if [ "$FRAME_START" -gt "$FRAME_END" ]; then
+    echo "[Foton] All frames already completed!"
+    report_status "completed"
+    exit 0
+  fi
+fi
 
 echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}, samples=${MAX_SAMPLES}"
 
@@ -448,11 +465,11 @@ while true; do
     break
   fi
 
-  # ── Heartbeat / cancellation check (~every 30s) ──
+  # ── Heartbeat / cancellation check (~every 20s) ──
   HB_TICK=$(( HB_TICK + 1 ))
-  if [ "$HB_TICK" -ge 15 ]; then
+  if [ "$HB_TICK" -ge 10 ]; then
     HB_TICK=0
-    HB_ACTION=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/heartbeat" \
+    HB_ACTION=$(curl -s --connect-timeout 5 --max-time 15 -X POST "${FOTON_API_URL}/instances/heartbeat" \
       -H "Content-Type: application/json" \
       -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" \
       | python3 -c "import sys,json; print(json.load(sys.stdin).get('action') or '')" 2>/dev/null)
