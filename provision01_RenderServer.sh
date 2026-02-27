@@ -225,7 +225,9 @@ if [ -n "$COMPLETED_MAX" ]; then
   fi
 fi
 
-echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}, samples=${MAX_SAMPLES}"
+export IS_BENCHMARK=$(echo "$CONFIG" | python3 -c "import sys,json; print(1 if json.load(sys.stdin).get('isBenchmark') else 0)")
+
+echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, camera=${CAMERA}, samples=${MAX_SAMPLES}, benchmark=${IS_BENCHMARK}"
 
 # Map file extension to Blender format string
 # Also normalize FILE_EXT to match what Blender actually writes on disk
@@ -238,7 +240,323 @@ case "$FILE_EXT" in
 esac
 
 # ═══════════════════════════════════════════════════════════════
-# 5. CREATE SCENE SETUP SCRIPT
+# BENCHMARK TWO-PASS MODE
+# ═══════════════════════════════════════════════════════════════
+
+if [ "$IS_BENCHMARK" = "1" ]; then
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🧪 BENCHMARK MODE (Two-Pass)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+mkdir -p /root/output
+
+# Create setup script for benchmark (same as normal but parameterised samples)
+cat > /root/bench_setup.py << 'PYEOF'
+import bpy
+import os
+import sys
+
+def env(key):
+    val = os.environ.get(key)
+    if val is None:
+        print(f"[Foton] FATAL: Missing env var {key}")
+        sys.exit(1)
+    return val
+
+RES_X = int(env('RES_X'))
+RES_Y = int(env('RES_Y'))
+FRAME_START = int(env('FRAME_START'))
+FRAME_END = int(env('FRAME_END'))
+FRAME_INC = int(env('FRAME_INC'))
+CAMERA = env('CAMERA')
+ENGINE = env('RENDER_ENGINE')
+SAMPLES = int(env('BENCH_SAMPLES'))
+FILE_FORMAT = env('BLENDER_FORMAT')
+OUTPUT_NAMING = env('OUTPUT_NAMING')
+
+scene = bpy.context.scene
+scene.render.resolution_x = RES_X
+scene.render.resolution_y = RES_Y
+scene.render.resolution_percentage = 100
+scene.frame_start = FRAME_START
+scene.frame_end = FRAME_END
+scene.frame_step = FRAME_INC
+
+if CAMERA and CAMERA in bpy.data.objects:
+    scene.camera = bpy.data.objects[CAMERA]
+if ENGINE:
+    scene.render.engine = ENGINE
+
+if SAMPLES > 0:
+    if ENGINE == 'CYCLES':
+        scene.cycles.samples = SAMPLES
+        scene.cycles.device = 'GPU'
+    elif ENGINE in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):
+        scene.eevee.taa_render_samples = SAMPLES
+
+scene.render.image_settings.file_format = FILE_FORMAT
+scene.render.filepath = f"/root/output/{OUTPUT_NAMING}_"
+scene.render.use_file_extension = True
+print(f"[Foton] Bench setup: {RES_X}x{RES_Y}, frames {FRAME_START}-{FRAME_END} step {FRAME_INC}, engine={ENGINE}, format={FILE_FORMAT}, samples={SAMPLES}")
+PYEOF
+
+report_status "rendering"
+echo "[Foton] Status → rendering"
+
+# ── Pass 0: Warmup (single frame at 1 sample — compiles GPU kernels) ──
+echo "[Foton] Pass 0: Warmup render (1 sample, first frame only)..."
+export BENCH_SAMPLES=1
+WARMUP_LOG="/root/warmup.log"
+/opt/blender/blender -b /root/scene.blend \
+  -P /opt/blender/activate_gpu.py \
+  -P /root/bench_setup.py \
+  -f "$FRAME_START" > "$WARMUP_LOG" 2>&1
+echo "[Foton] Warmup complete. GPU kernels compiled."
+rm -f /root/output/*  # Discard warmup output
+
+# ── Pass 1: 1-sample pass across all benchmark frames (baseline timing) ──
+echo "[Foton] Pass 1: 1-sample baseline across all frames..."
+export BENCH_SAMPLES=1
+PASS1_LOG="/root/pass1.log"
+/opt/blender/blender -b /root/scene.blend \
+  -P /opt/blender/activate_gpu.py \
+  -P /root/bench_setup.py \
+  -a > "$PASS1_LOG" 2>&1
+
+# Parse per-frame warmup times from Pass 1 log
+declare -A WARMUP_TIMES
+PASS1_FRAMES=()
+for f in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
+  PASS1_FRAMES+=("$f")
+done
+# Extract all Time: entries from the pass1 log
+PASS1_TIMES=()
+while IFS= read -r line; do
+  PASS1_TIMES+=("$line")
+done < <(grep -oP 'Time:\s+\K[0-9]+:[0-9]+\.[0-9]+' "$PASS1_LOG")
+
+for i in "${!PASS1_FRAMES[@]}"; do
+  if [ "$i" -lt "${#PASS1_TIMES[@]}" ]; then
+    TIME_LINE="${PASS1_TIMES[$i]}"
+    MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
+    SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
+    WARMUP_TIMES[${PASS1_FRAMES[$i]}]=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
+    echo "[Foton] Pass 1 frame ${PASS1_FRAMES[$i]}: ${WARMUP_TIMES[${PASS1_FRAMES[$i]}]}s"
+  fi
+done
+
+# Delete 1-sample output files
+rm -f /root/output/*
+echo "[Foton] Pass 1 complete. Warmup times recorded."
+
+# ── Pass 2: N-sample full render + watchdog ──
+echo "[Foton] Pass 2: Full render at ${MAX_SAMPLES} samples..."
+export BENCH_SAMPLES="$MAX_SAMPLES"
+BLENDER_LOG="/root/blender.log"
+> "$BLENDER_LOG"
+
+/opt/blender/blender -b /root/scene.blend \
+  -P /opt/blender/activate_gpu.py \
+  -P /root/bench_setup.py \
+  -a > "$BLENDER_LOG" 2>&1 &
+BLENDER_PID=$!
+echo "[Foton] Blender launched for Pass 2 (PID: $BLENDER_PID)"
+
+# Build expected frames
+EXPECTED_FRAMES=()
+for f in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
+  EXPECTED_FRAMES+=("$f")
+done
+TOTAL=${#EXPECTED_FRAMES[@]}
+echo "[Foton] Expecting ${TOTAL} frames."
+
+# ── Watchdog Loop (same as normal render) ──
+NEXT=0
+HB_TICK=0
+CANCELLED=false
+BLENDER_EXIT=0
+LOG_OFFSET=0
+
+while true; do
+  BLENDER_ALIVE=true
+  if ! kill -0 "$BLENDER_PID" 2>/dev/null; then
+    BLENDER_ALIVE=false
+    wait "$BLENDER_PID" 2>/dev/null
+    BLENDER_EXIT=$?
+  fi
+
+  while [ "$NEXT" -lt "$TOTAL" ]; do
+    FRAME=${EXPECTED_FRAMES[$NEXT]}
+    PADDED=$(printf "%04d" "$FRAME")
+    FILE="/root/output/${OUTPUT_NAMING}_${PADDED}.${FILE_EXT}"
+
+    [ ! -f "$FILE" ] && break
+
+    SAFE=false
+    if [ "$BLENDER_ALIVE" = false ]; then
+      SAFE=true
+    elif [ $(( NEXT + 1 )) -lt "$TOTAL" ]; then
+      NF=${EXPECTED_FRAMES[$(( NEXT + 1 ))]}
+      NP=$(printf "%04d" "$NF")
+      [ -f "/root/output/${OUTPUT_NAMING}_${NP}.${FILE_EXT}" ] && SAFE=true
+    fi
+    [ "$SAFE" = false ] && break
+
+    # Get presigned upload URL
+    UPLOAD_URL=""
+    for RETRY in 1 2 3; do
+      UPLOAD_URL=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/frame-upload-url" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"frameNumber\": ${FRAME}}" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadUrl') or '')" 2>/dev/null)
+      [ -n "$UPLOAD_URL" ] && break
+      echo "[Foton] Retry ${RETRY}: failed to get upload URL for frame ${FRAME}"
+      sleep 2
+    done
+
+    if [ -z "$UPLOAD_URL" ]; then
+      echo "[Foton] ERROR: No upload URL for frame ${FRAME} after 3 retries. Aborting."
+      kill "$BLENDER_PID" 2>/dev/null
+      wait "$BLENDER_PID" 2>/dev/null
+      BLENDER_ALIVE=false
+      BLENDER_EXIT=1
+      break 2
+    fi
+
+    # Upload file
+    UPLOAD_OK=false
+    for RETRY in 1 2 3; do
+      HTTP_CODE=$(curl -s --connect-timeout 10 --max-time 120 -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@${FILE}")
+      if [ "$HTTP_CODE" = "200" ]; then
+        UPLOAD_OK=true
+        break
+      fi
+      echo "[Foton] Retry ${RETRY}: upload for frame ${FRAME} returned HTTP ${HTTP_CODE}"
+      sleep 2
+    done
+
+    if [ "$UPLOAD_OK" = false ]; then
+      echo "[Foton] ERROR: Upload failed for frame ${FRAME} after 3 retries. Aborting."
+      kill "$BLENDER_PID" 2>/dev/null
+      wait "$BLENDER_PID" 2>/dev/null
+      BLENDER_ALIVE=false
+      BLENDER_EXIT=1
+      break 2
+    fi
+
+    # Parse render time from log
+    RENDER_TIME=""
+    NEW_LOG=$(tail -c +$(( LOG_OFFSET + 1 )) "$BLENDER_LOG" 2>/dev/null)
+    LOG_OFFSET=$(wc -c < "$BLENDER_LOG")
+
+    TIME_LINE=$(echo "$NEW_LOG" | grep -oP 'Time:\s+\K[0-9]+:[0-9]+\.[0-9]+' | tail -1)
+    if [ -n "$TIME_LINE" ]; then
+      MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
+      SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
+      RENDER_TIME=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
+    fi
+
+    # Get warmup time for this frame
+    FRAME_WARMUP="${WARMUP_TIMES[$FRAME]:-}"
+
+    # Report progress with warmupTime
+    if [ -n "$RENDER_TIME" ] && [ -n "$FRAME_WARMUP" ]; then
+      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME},\"renderTime\":${RENDER_TIME},\"warmupTime\":${FRAME_WARMUP}}" > /dev/null
+    elif [ -n "$RENDER_TIME" ]; then
+      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME},\"renderTime\":${RENDER_TIME}}" > /dev/null
+    else
+      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME}}" > /dev/null
+    fi
+
+    rm -f "$FILE"
+    NEXT=$(( NEXT + 1 ))
+    echo "[Foton] Frame ${FRAME} uploaded. (${NEXT}/${TOTAL}${RENDER_TIME:+, ${RENDER_TIME}s}${FRAME_WARMUP:+, warmup=${FRAME_WARMUP}s})"
+  done
+
+  if [ "$NEXT" -ge "$TOTAL" ]; then
+    echo "[Foton] All ${TOTAL} benchmark frames uploaded."
+    break
+  fi
+
+  if [ "$BLENDER_ALIVE" = false ]; then
+    if [ "$BLENDER_EXIT" -ne 0 ]; then
+      echo "[Foton] Blender crashed (exit code ${BLENDER_EXIT}). ${NEXT}/${TOTAL} frames uploaded."
+    else
+      echo "[Foton] Blender finished but only ${NEXT}/${TOTAL} frames were found."
+    fi
+    break
+  fi
+
+  HB_TICK=$(( HB_TICK + 1 ))
+  if [ "$HB_TICK" -ge 10 ]; then
+    HB_TICK=0
+    HB_ACTION=$(curl -s --connect-timeout 5 --max-time 15 -X POST "${FOTON_API_URL}/instances/heartbeat" \
+      -H "Content-Type: application/json" \
+      -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\"}" \
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('action') or '')" 2>/dev/null)
+    if [ "$HB_ACTION" = "shutdown" ]; then
+      echo "[Foton] Shutdown signal received. Killing Blender..."
+      kill "$BLENDER_PID" 2>/dev/null
+      wait "$BLENDER_PID" 2>/dev/null
+      CANCELLED=true
+      break
+    fi
+  fi
+
+  sleep 2
+done
+
+# Kill background processes
+kill "$HEARTBEAT_PID" 2>/dev/null
+kill "$LOG_SERVER_PID" 2>/dev/null
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [ "$CANCELLED" = true ]; then
+  echo "[Foton] Benchmark was cancelled. Exiting."
+  exit 0
+fi
+
+if [ "$NEXT" -ge "$TOTAL" ]; then
+  FINAL_STATUS="completed"
+else
+  FINAL_STATUS="failed"
+fi
+
+echo "[Foton] Benchmark reporting: ${FINAL_STATUS}"
+
+for ATTEMPT in 1 2 3; do
+  HTTP_STATUS=$(curl -s --connect-timeout 10 --max-time 30 -o /dev/null -w "%{http_code}" -X POST "${FOTON_API_URL}/instances/report" \
+    -H "Content-Type: application/json" \
+    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"status\": \"${FINAL_STATUS}\"}")
+
+  if [ "$HTTP_STATUS" = "200" ]; then
+    echo "[Foton] Benchmark ${FINAL_STATUS}. Instance will be destroyed by API."
+    break
+  else
+    echo "[Foton] WARNING: Final report attempt ${ATTEMPT} failed (HTTP ${HTTP_STATUS})"
+    sleep 5
+  fi
+done
+
+echo "[Foton] Done."
+exit 0
+
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 5. CREATE SCENE SETUP SCRIPT (Normal Render)
 # ═══════════════════════════════════════════════════════════════
 
 mkdir -p /root/output
