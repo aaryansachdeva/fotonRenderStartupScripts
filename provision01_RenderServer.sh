@@ -138,7 +138,33 @@ echo "[Foton] GPU activation script ready."
 echo "[Foton] All systems onboarded."
 
 # ═══════════════════════════════════════════════════════════════
-# 3. ACCESSING IMPERIAL BLUEPRINTS (Downloading Project Files)
+# 3. FETCH RENDER CONFIG (needed before download to know upload type)
+# ═══════════════════════════════════════════════════════════════
+
+if [ -z "$FOTON_API_URL" ]; then
+  echo "[Foton] No API URL set. Skipping render."
+  exit 0
+fi
+
+echo ""
+echo "[Foton] Fetching render config..."
+CONFIG=$(curl -s "${FOTON_API_URL}/instances/render-config?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}")
+
+export FRAME_START=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['frameStart'])")
+export FRAME_END=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameEnd'])")
+export FRAME_INC=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameIncrement'])")
+export RES_X=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionX'])")
+export RES_Y=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionY'])")
+export CAMERA=$(echo "$CONFIG"       | python3 -c "import sys,json; print(json.load(sys.stdin)['camera'])")
+export RENDER_ENGINE=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['renderEngine'])")
+export FILE_EXT=$(echo "$CONFIG"     | python3 -c "import sys,json; print(json.load(sys.stdin)['fileExtension'])")
+export OUTPUT_NAMING=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputFileNaming'])")
+export MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['maxSamples'])")
+export UPLOAD_TYPE=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadType') or 'blend')" 2>/dev/null)
+export BLEND_RELATIVE_PATH=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendRelativePath') or '')" 2>/dev/null)
+
+# ═══════════════════════════════════════════════════════════════
+# 4. ACCESSING IMPERIAL BLUEPRINTS (Downloading Project Files)
 # ═══════════════════════════════════════════════════════════════
 
 echo ""
@@ -167,11 +193,29 @@ if [ -n "$FOTON_API_URL" ]; then
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
   done
 
-  echo "[Foton] Downloading project file..."
-  curl -# --connect-timeout 15 --max-time 600 -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+  if [ "$UPLOAD_TYPE" = "project" ]; then
+    # Project flow: download tar.gz → extract to /root/project/
+    echo "[Foton] Downloading project archive..."
+    curl -# --connect-timeout 15 --max-time 1800 -o /root/project.tar.gz "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
 
-  BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
-  echo "[Foton] Project file downloaded (${BLEND_SIZE})."
+    ARCHIVE_SIZE=$(du -h /root/project.tar.gz | cut -f1)
+    echo "[Foton] Project archive downloaded (${ARCHIVE_SIZE}). Extracting..."
+
+    mkdir -p /root/project
+    tar -xzf /root/project.tar.gz -C /root/project
+    rm -f /root/project.tar.gz
+
+    BLEND_FILE="/root/project/${BLEND_RELATIVE_PATH}"
+    echo "[Foton] Project extracted. Blend file: ${BLEND_FILE}"
+  else
+    # Single file flow: download as scene.blend
+    echo "[Foton] Downloading project file..."
+    curl -# --connect-timeout 15 --max-time 600 -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+
+    BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
+    echo "[Foton] Project file downloaded (${BLEND_SIZE})."
+    BLEND_FILE="/root/scene.blend"
+  fi
 
   # Report blend downloaded
   curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/report" \
@@ -183,30 +227,6 @@ fi
 rm /root/installing
 touch /root/ready
 echo "[Foton] Node fully provisioned and ready."
-
-# ═══════════════════════════════════════════════════════════════
-# 4. FETCH RENDER CONFIG
-# ═══════════════════════════════════════════════════════════════
-
-if [ -z "$FOTON_API_URL" ]; then
-  echo "[Foton] No API URL set. Skipping render."
-  exit 0
-fi
-
-echo ""
-echo "[Foton] Fetching render config..."
-CONFIG=$(curl -s "${FOTON_API_URL}/instances/render-config?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}")
-
-export FRAME_START=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['frameStart'])")
-export FRAME_END=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameEnd'])")
-export FRAME_INC=$(echo "$CONFIG"    | python3 -c "import sys,json; print(json.load(sys.stdin)['frameIncrement'])")
-export RES_X=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionX'])")
-export RES_Y=$(echo "$CONFIG"        | python3 -c "import sys,json; print(json.load(sys.stdin)['resolutionY'])")
-export CAMERA=$(echo "$CONFIG"       | python3 -c "import sys,json; print(json.load(sys.stdin)['camera'])")
-export RENDER_ENGINE=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['renderEngine'])")
-export FILE_EXT=$(echo "$CONFIG"     | python3 -c "import sys,json; print(json.load(sys.stdin)['fileExtension'])")
-export OUTPUT_NAMING=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputFileNaming'])")
-export MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin)['maxSamples'])")
 
 # ── Skip completed frames on recovery ──
 COMPLETED_MAX=$(echo "$CONFIG" | python3 -c "
@@ -309,7 +329,7 @@ echo "[Foton] Status → rendering"
 echo "[Foton] Pass 0: Warmup render (1 sample, first frame only)..."
 export BENCH_SAMPLES=1
 WARMUP_LOG="/root/warmup.log"
-/opt/blender/blender -b /root/scene.blend \
+/opt/blender/blender -b "$BLEND_FILE" \
   -P /opt/blender/activate_gpu.py \
   -P /root/bench_setup.py \
   -f "$FRAME_START" > "$WARMUP_LOG" 2>&1
@@ -320,7 +340,7 @@ rm -f /root/output/*  # Discard warmup output
 echo "[Foton] Pass 1: 1-sample baseline across all frames..."
 export BENCH_SAMPLES=1
 PASS1_LOG="/root/pass1.log"
-/opt/blender/blender -b /root/scene.blend \
+/opt/blender/blender -b "$BLEND_FILE" \
   -P /opt/blender/activate_gpu.py \
   -P /root/bench_setup.py \
   -a > "$PASS1_LOG" 2>&1
@@ -342,7 +362,7 @@ for i in "${!PASS1_FRAMES[@]}"; do
     TIME_LINE="${PASS1_TIMES[$i]}"
     MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
     SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
-    WARMUP_TIMES[${PASS1_FRAMES[$i]}]=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
+    WARMUP_TIMES[${PASS1_FRAMES[$i]}]=$(python3 -c "print(int('${MINUTES}')*60 + float('${SECONDS_PART}'))")
     echo "[Foton] Pass 1 frame ${PASS1_FRAMES[$i]}: ${WARMUP_TIMES[${PASS1_FRAMES[$i]}]}s"
   fi
 done
@@ -357,7 +377,7 @@ export BENCH_SAMPLES="$MAX_SAMPLES"
 BLENDER_LOG="/root/blender.log"
 > "$BLENDER_LOG"
 
-/opt/blender/blender -b /root/scene.blend \
+/opt/blender/blender -b "$BLEND_FILE" \
   -P /opt/blender/activate_gpu.py \
   -P /root/bench_setup.py \
   -a > "$BLENDER_LOG" 2>&1 &
@@ -457,7 +477,7 @@ while true; do
     if [ -n "$TIME_LINE" ]; then
       MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
       SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
-      RENDER_TIME=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
+      RENDER_TIME=$(python3 -c "print(int('${MINUTES}')*60 + float('${SECONDS_PART}'))")
     fi
 
     # Get warmup time for this frame
@@ -641,7 +661,7 @@ echo "[Foton] Status → rendering"
 BLENDER_LOG="/root/blender.log"
 > "$BLENDER_LOG"
 
-/opt/blender/blender -b /root/scene.blend \
+/opt/blender/blender -b "$BLEND_FILE" \
   -P /opt/blender/activate_gpu.py \
   -P /root/render_setup.py \
   -a > "$BLENDER_LOG" 2>&1 &
@@ -747,7 +767,7 @@ while true; do
     if [ -n "$TIME_LINE" ]; then
       MINUTES=$(echo "$TIME_LINE" | cut -d: -f1)
       SECONDS_PART=$(echo "$TIME_LINE" | cut -d: -f2)
-      RENDER_TIME=$(python3 -c "print(int(${MINUTES})*60 + float(${SECONDS_PART}))")
+      RENDER_TIME=$(python3 -c "print(int('${MINUTES}')*60 + float('${SECONDS_PART}'))")
     fi
 
     # ── Report progress ──
