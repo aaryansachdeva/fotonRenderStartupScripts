@@ -39,51 +39,56 @@ mkdir -p /var/run/sshd
 service ssh start
 echo "[Foton] SSH service started."
 
-# ── Log Server (serves provisioning + blender logs over HTTP) ──
+# ── Log Pusher (sends new log bytes to API every 5s) ──
 
-cat > /root/log_server.py << 'PYEOF'
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
+PROV_LOG_FILE="/var/log/portal/provisioning.log"
+BLENDER_LOG_FILE="/root/blender.log"
 
-TOKEN = os.environ.get('FOTON_INSTANCE_TOKEN', '')
-LOG_FILES = {
-    '/provisioning': '/var/log/portal/provisioning.log',
-    '/blender': '/root/blender.log'
+# Use temp files for offsets so background subshell and main script stay in sync
+echo 0 > /tmp/prov_log_offset
+echo 0 > /tmp/blender_log_offset
+
+push_logs() {
+  # Push provisioning log
+  if [ -f "$PROV_LOG_FILE" ]; then
+    local PROV_OFFSET=$(cat /tmp/prov_log_offset)
+    local PROV_SIZE=$(wc -c < "$PROV_LOG_FILE")
+    if [ "$PROV_SIZE" -gt "$PROV_OFFSET" ]; then
+      local PROV_CHUNK=$(tail -c +$(( PROV_OFFSET + 1 )) "$PROV_LOG_FILE")
+      if [ -n "$PROV_CHUNK" ]; then
+        local ESCAPED=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$PROV_CHUNK")
+        curl -s --connect-timeout 5 --max-time 15 -X POST "${FOTON_API_URL}/instances/logs" \
+          -H "Content-Type: application/json" \
+          -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"type\":\"provisioning\",\"content\":${ESCAPED}}" > /dev/null 2>&1
+        echo "$PROV_SIZE" > /tmp/prov_log_offset
+      fi
+    fi
+  fi
+
+  # Push blender log
+  if [ -f "$BLENDER_LOG_FILE" ]; then
+    local BL_OFFSET=$(cat /tmp/blender_log_offset)
+    local BLENDER_SIZE=$(wc -c < "$BLENDER_LOG_FILE")
+    if [ "$BLENDER_SIZE" -gt "$BL_OFFSET" ]; then
+      local BLENDER_CHUNK=$(tail -c +$(( BL_OFFSET + 1 )) "$BLENDER_LOG_FILE")
+      if [ -n "$BLENDER_CHUNK" ]; then
+        local ESCAPED=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$BLENDER_CHUNK")
+        curl -s --connect-timeout 5 --max-time 15 -X POST "${FOTON_API_URL}/instances/logs" \
+          -H "Content-Type: application/json" \
+          -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"type\":\"blender\",\"content\":${ESCAPED}}" > /dev/null 2>&1
+        echo "$BLENDER_SIZE" > /tmp/blender_log_offset
+      fi
+    fi
+  fi
 }
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        params = dict(p.split('=',1) for p in (self.path.split('?',1)[1] if '?' in self.path else '').split('&') if '=' in p)
-        if params.get('token') != TOKEN:
-            self.send_response(403); self.end_headers(); return
-        path = self.path.split('?')[0]
-        log_file = LOG_FILES.get(path)
-        if not log_file or not os.path.exists(log_file):
-            self.send_response(404); self.end_headers(); return
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        with open(log_file, 'rb') as f:
-            self.wfile.write(f.read())
-    def log_message(self, *args): pass
-
-HTTPServer(('0.0.0.0', 8081), Handler).serve_forever()
-PYEOF
-
-python3 /root/log_server.py &
-LOG_SERVER_PID=$!
-
-# Compute public log URL from Vast.ai env vars
-EXTERNAL_PORT=${VAST_TCP_PORT_8081:-8081}
-LOG_BASE_URL="http://${PUBLIC_IPADDR}:${EXTERNAL_PORT}"
-echo "[Foton] Log server started → ${LOG_BASE_URL}"
-
-# Report log URL so the app can start showing logs immediately
 if [ -n "$FOTON_API_URL" ]; then
-  curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/report" \
-    -H "Content-Type: application/json" \
-    -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"logBaseUrl\": \"${LOG_BASE_URL}\"}" > /dev/null
+  (while true; do
+    push_logs
+    sleep 5
+  done) &
+  LOG_PUSHER_PID=$!
+  echo "[Foton] Log pusher active (every 5s)."
 fi
 
 # ── Heartbeat (background keep-alive ping) ──
@@ -538,7 +543,10 @@ done
 
 # Kill background processes
 kill "$HEARTBEAT_PID" 2>/dev/null
-kill "$LOG_SERVER_PID" 2>/dev/null
+kill "$LOG_PUSHER_PID" 2>/dev/null
+
+# Final log push to capture last lines
+push_logs
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -825,7 +833,10 @@ done
 
 # Kill background processes
 kill "$HEARTBEAT_PID" 2>/dev/null
-kill "$LOG_SERVER_PID" 2>/dev/null
+kill "$LOG_PUSHER_PID" 2>/dev/null
+
+# Final log push to capture last lines
+push_logs
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
