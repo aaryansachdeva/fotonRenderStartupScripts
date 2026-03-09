@@ -42,11 +42,8 @@ echo "[Foton] SSH service started."
 # ── Log Pusher (sends new log bytes to API every 5s) ──
 
 PROV_LOG_FILE="/var/log/portal/provisioning.log"
-BLENDER_LOG_FILE="/root/blender.log"
-
 # Use temp files for offsets so background subshell and main script stay in sync
 echo 0 > /tmp/prov_log_offset
-echo 0 > /tmp/blender_log_offset
 
 push_logs() {
   # Push provisioning log
@@ -65,21 +62,6 @@ push_logs() {
     fi
   fi
 
-  # Push blender log
-  if [ -f "$BLENDER_LOG_FILE" ]; then
-    local BL_OFFSET=$(cat /tmp/blender_log_offset)
-    local BLENDER_SIZE=$(wc -c < "$BLENDER_LOG_FILE")
-    if [ "$BLENDER_SIZE" -gt "$BL_OFFSET" ]; then
-      local BLENDER_CHUNK=$(tail -c +$(( BL_OFFSET + 1 )) "$BLENDER_LOG_FILE")
-      if [ -n "$BLENDER_CHUNK" ]; then
-        local ESCAPED=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$BLENDER_CHUNK")
-        curl -s --connect-timeout 5 --max-time 15 -X POST "${FOTON_API_URL}/instances/logs" \
-          -H "Content-Type: application/json" \
-          -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"type\":\"blender\",\"content\":${ESCAPED}}" > /dev/null 2>&1
-        echo "$BLENDER_SIZE" > /tmp/blender_log_offset
-      fi
-    fi
-  fi
 }
 
 if [ -n "$FOTON_API_URL" ]; then
@@ -198,8 +180,16 @@ if [ -n "$FOTON_API_URL" ]; then
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendUrl') or '')" 2>/dev/null)
   done
 
-  if [ "$UPLOAD_TYPE" = "project" ]; then
-    # Project flow: download tar.gz → extract to /root/project/
+  if [ "$UPLOAD_TYPE" = "blend" ]; then
+    # Legacy single-file flow: download as scene.blend
+    echo "[Foton] Downloading project file..."
+    curl -# --connect-timeout 15 --max-time 600 -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+
+    BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
+    echo "[Foton] Project file downloaded (${BLEND_SIZE})."
+    BLEND_FILE="/root/scene.blend"
+  else
+    # Archive flow: download tar.gz → extract to /root/project/
     echo "[Foton] Downloading project archive..."
     curl -# --connect-timeout 15 --max-time 1800 -o /root/project.tar.gz "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
 
@@ -212,14 +202,6 @@ if [ -n "$FOTON_API_URL" ]; then
 
     BLEND_FILE="/root/project/${BLEND_RELATIVE_PATH}"
     echo "[Foton] Project extracted. Blend file: ${BLEND_FILE}"
-  else
-    # Single file flow: download as scene.blend
-    echo "[Foton] Downloading project file..."
-    curl -# --connect-timeout 15 --max-time 600 -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
-
-    BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
-    echo "[Foton] Project file downloaded (${BLEND_SIZE})."
-    BLEND_FILE="/root/scene.blend"
   fi
 
   # Report blend downloaded
