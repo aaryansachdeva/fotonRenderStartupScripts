@@ -234,20 +234,48 @@ touch /root/ready
 echo "[Foton] Node fully provisioned and ready."
 
 # ── Skip completed frames on recovery ──
-COMPLETED_MAX=$(echo "$CONFIG" | python3 -c "
+# Build a set of completed frame numbers so we can skip them individually
+# (not just max — there may be gaps where progress reports were lost)
+COMPLETED_SET=$(echo "$CONFIG" | python3 -c "
 import sys,json
 cf = json.load(sys.stdin).get('completedFrames', [])
-print(max(cf) if cf else '')
+print(' '.join(str(f) for f in cf))
 " 2>/dev/null)
 
-if [ -n "$COMPLETED_MAX" ]; then
-  FRAME_START=$(( COMPLETED_MAX + FRAME_INC ))
-  echo "[Foton] Resuming from frame ${FRAME_START} (skipping completed frames, max was ${COMPLETED_MAX})"
-  if [ "$FRAME_START" -gt "$FRAME_END" ]; then
+if [ -n "$COMPLETED_SET" ]; then
+  # Store completed frames in an associative array for O(1) lookup
+  declare -A COMPLETED_MAP
+  COMPLETED_COUNT=0
+  for f in $COMPLETED_SET; do
+    COMPLETED_MAP[$f]=1
+    COMPLETED_COUNT=$(( COMPLETED_COUNT + 1 ))
+  done
+
+  # Count total expected frames
+  TOTAL_EXPECTED=0
+  for f in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
+    TOTAL_EXPECTED=$(( TOTAL_EXPECTED + 1 ))
+  done
+
+  echo "[Foton] Recovery: ${COMPLETED_COUNT}/${TOTAL_EXPECTED} frames already completed"
+
+  if [ "$COMPLETED_COUNT" -ge "$TOTAL_EXPECTED" ]; then
     echo "[Foton] All frames already completed!"
     report_status "completed"
     exit 0
   fi
+
+  # Find the earliest missing frame to set as FRAME_START for Blender
+  for f in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
+    if [ "${COMPLETED_MAP[$f]:-0}" != "1" ]; then
+      FRAME_START=$f
+      break
+    fi
+  done
+  echo "[Foton] Blender will start from frame ${FRAME_START}"
+
+  # Export the set so the watchdog loop can skip completed frames
+  export RECOVERY_MODE=1
 fi
 
 export IS_BENCHMARK=$(echo "$CONFIG" | python3 -c "import sys,json; print(1 if json.load(sys.stdin).get('isBenchmark') else 0)")
@@ -676,13 +704,20 @@ BLENDER_LOG="/root/blender.log"
 BLENDER_PID=$!
 echo "[Foton] Blender launched (PID: $BLENDER_PID)"
 
-# Build ordered list of expected frame numbers
+# Build ordered list of expected frame numbers (skipping already-completed frames in recovery)
 EXPECTED_FRAMES=()
 for f in $(seq "$FRAME_START" "$FRAME_INC" "$FRAME_END"); do
+  if [ "${RECOVERY_MODE:-0}" = "1" ] && [ "${COMPLETED_MAP[$f]:-0}" = "1" ]; then
+    continue  # Skip frames already completed in previous instance
+  fi
   EXPECTED_FRAMES+=("$f")
 done
 TOTAL=${#EXPECTED_FRAMES[@]}
-echo "[Foton] Expecting ${TOTAL} frames."
+if [ "${RECOVERY_MODE:-0}" = "1" ]; then
+  echo "[Foton] Expecting ${TOTAL} remaining frames (skipped completed)."
+else
+  echo "[Foton] Expecting ${TOTAL} frames."
+fi
 
 # ── Watchdog Loop ─────────────────────────────────────────────
 
@@ -778,15 +813,29 @@ while true; do
       RENDER_TIME=$(python3 -c "print(int('${MINUTES}')*60 + float('${SECONDS_PART}'))")
     fi
 
-    # ── Report progress ──
-    if [ -n "$RENDER_TIME" ]; then
-      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
-        -H "Content-Type: application/json" \
-        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}, \"renderTime\": ${RENDER_TIME}}" > /dev/null
-    else
-      curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
-        -H "Content-Type: application/json" \
-        -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}" > /dev/null
+    # ── Report progress (with retry + verification) ──
+    PROGRESS_OK=false
+    for RETRY in 1 2 3; do
+      if [ -n "$RENDER_TIME" ]; then
+        PROGRESS_RESP=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+          -H "Content-Type: application/json" \
+          -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}, \"renderTime\": ${RENDER_TIME}}")
+      else
+        PROGRESS_RESP=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+          -H "Content-Type: application/json" \
+          -d "{\"taskId\": \"${FOTON_TASK_ID}\", \"token\": \"${FOTON_INSTANCE_TOKEN}\", \"currentFrame\": ${FRAME}, \"completedFrame\": ${FRAME}}")
+      fi
+      # Verify server acknowledged
+      PROGRESS_SUCCESS=$(echo "$PROGRESS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
+      if [ "$PROGRESS_SUCCESS" = "True" ]; then
+        PROGRESS_OK=true
+        break
+      fi
+      echo "[Foton] Retry ${RETRY}: progress report for frame ${FRAME} not acknowledged"
+      sleep 2
+    done
+    if [ "$PROGRESS_OK" = false ]; then
+      echo "[Foton] WARNING: Progress report for frame ${FRAME} failed after 3 retries (frame is in R2 but may not be tracked)"
     fi
 
     # Clean up to save disk
