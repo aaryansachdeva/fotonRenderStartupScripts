@@ -101,7 +101,7 @@ echo "[Foton] Status → downloading_software"
 echo "[Foton] Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq wget xz-utils libgl1 libxrandr2 libxinerama1 \
-  libxcursor1 libxi6 libxxf86vm1 libsm6 libxext6 openssh-server python3 curl
+  libxcursor1 libxi6 libxxf86vm1 libsm6 libxext6 openssh-server python3 curl zstd
 echo "[Foton] System dependencies installed."
 
 if [ ! -d "/opt/blender" ]; then
@@ -189,16 +189,33 @@ if [ -n "$FOTON_API_URL" ]; then
     echo "[Foton] Project file downloaded (${BLEND_SIZE})."
     BLEND_FILE="/root/scene.blend"
   else
-    # Archive flow: download tar.gz → extract to /root/project/
+    # Archive flow: download archive → detect format → extract to /root/project/
     echo "[Foton] Downloading project archive..."
-    curl -# --connect-timeout 15 --max-time 1800 -o /root/project.tar.gz "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+    ARCHIVE_FILE="/root/project_archive"
+    curl -# --connect-timeout 15 --max-time 1800 -o "$ARCHIVE_FILE" "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
 
-    ARCHIVE_SIZE=$(du -h /root/project.tar.gz | cut -f1)
+    ARCHIVE_SIZE=$(du -h "$ARCHIVE_FILE" | cut -f1)
     echo "[Foton] Project archive downloaded (${ARCHIVE_SIZE}). Extracting..."
 
     mkdir -p /root/project
-    tar -xzf /root/project.tar.gz -C /root/project
-    rm -f /root/project.tar.gz
+    # Detect format: check URL path first, then fall back to file magic bytes
+    if echo "$BLEND_URL" | grep -q '\.tar\.zst'; then
+      echo "[Foton] Format: zstd"
+      tar -I zstd -xf "$ARCHIVE_FILE" -C /root/project
+    elif echo "$BLEND_URL" | grep -q '\.tar\.gz'; then
+      echo "[Foton] Format: gzip"
+      tar -xzf "$ARCHIVE_FILE" -C /root/project
+    else
+      # Fallback: detect from magic bytes (zstd magic = 28 b5 2f fd)
+      if file "$ARCHIVE_FILE" | grep -q -i "zstandard"; then
+        echo "[Foton] Format (auto-detected): zstd"
+        tar -I zstd -xf "$ARCHIVE_FILE" -C /root/project
+      else
+        echo "[Foton] Format (auto-detected): gzip"
+        tar -xzf "$ARCHIVE_FILE" -C /root/project
+      fi
+    fi
+    rm -f "$ARCHIVE_FILE"
 
     BLEND_FILE="/root/project/${BLEND_RELATIVE_PATH}"
     echo "[Foton] Project extracted. Blend file: ${BLEND_FILE}"
