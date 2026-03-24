@@ -183,7 +183,13 @@ if [ -n "$FOTON_API_URL" ]; then
   if [ "$UPLOAD_TYPE" = "blend" ]; then
     # Legacy single-file flow: download as scene.blend
     echo "[Foton] Downloading project file..."
-    curl -# --connect-timeout 15 --max-time 600 -o /root/scene.blend "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+    HTTP_CODE=$(curl -s --connect-timeout 15 --max-time 600 -o /root/scene.blend -w "%{http_code}" "$BLEND_URL")
+
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "[Foton] FATAL: Download failed (HTTP $HTTP_CODE)"
+      report_status "failed"
+      exit 1
+    fi
 
     BLEND_SIZE=$(du -h /root/scene.blend | cut -f1)
     echo "[Foton] Project file downloaded (${BLEND_SIZE})."
@@ -192,29 +198,53 @@ if [ -n "$FOTON_API_URL" ]; then
     # Archive flow: download archive → detect format → extract to /root/project/
     echo "[Foton] Downloading project archive..."
     ARCHIVE_FILE="/root/project_archive"
-    curl -# --connect-timeout 15 --max-time 1800 -o "$ARCHIVE_FILE" "$BLEND_URL" 2>&1 | while IFS= read -r line; do echo "[Foton] $line"; done
+    HTTP_CODE=$(curl -s --connect-timeout 15 --max-time 1800 -o "$ARCHIVE_FILE" -w "%{http_code}" "$BLEND_URL")
 
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "[Foton] FATAL: Archive download failed (HTTP $HTTP_CODE)"
+      report_status "failed"
+      exit 1
+    fi
+
+    ARCHIVE_SIZE_BYTES=$(stat -c%s "$ARCHIVE_FILE" 2>/dev/null || stat -f%z "$ARCHIVE_FILE" 2>/dev/null)
     ARCHIVE_SIZE=$(du -h "$ARCHIVE_FILE" | cut -f1)
+
+    # Sanity check: archives under 10KB are likely error responses
+    if [ "$ARCHIVE_SIZE_BYTES" -lt 10240 ]; then
+      echo "[Foton] FATAL: Downloaded file too small (${ARCHIVE_SIZE}), likely an error response:"
+      head -c 500 "$ARCHIVE_FILE"
+      echo ""
+      report_status "failed"
+      exit 1
+    fi
+
     echo "[Foton] Project archive downloaded (${ARCHIVE_SIZE}). Extracting..."
 
     mkdir -p /root/project
     # Detect format: check URL path first, then fall back to file magic bytes
+    EXTRACT_OK=false
     if echo "$BLEND_URL" | grep -q '\.tar\.zst'; then
       echo "[Foton] Format: zstd"
-      tar -I zstd -xf "$ARCHIVE_FILE" -C /root/project
+      tar -I zstd -xf "$ARCHIVE_FILE" -C /root/project && EXTRACT_OK=true
     elif echo "$BLEND_URL" | grep -q '\.tar\.gz'; then
       echo "[Foton] Format: gzip"
-      tar -xzf "$ARCHIVE_FILE" -C /root/project
+      tar -xzf "$ARCHIVE_FILE" -C /root/project && EXTRACT_OK=true
     else
-      # Fallback: detect from magic bytes (zstd magic = 28 b5 2f fd)
       if file "$ARCHIVE_FILE" | grep -q -i "zstandard"; then
         echo "[Foton] Format (auto-detected): zstd"
-        tar -I zstd -xf "$ARCHIVE_FILE" -C /root/project
+        tar -I zstd -xf "$ARCHIVE_FILE" -C /root/project && EXTRACT_OK=true
       else
         echo "[Foton] Format (auto-detected): gzip"
-        tar -xzf "$ARCHIVE_FILE" -C /root/project
+        tar -xzf "$ARCHIVE_FILE" -C /root/project && EXTRACT_OK=true
       fi
     fi
+
+    if [ "$EXTRACT_OK" != "true" ]; then
+      echo "[Foton] FATAL: Archive extraction failed"
+      report_status "failed"
+      exit 1
+    fi
+
     rm -f "$ARCHIVE_FILE"
 
     BLEND_FILE="/root/project/${BLEND_RELATIVE_PATH}"
