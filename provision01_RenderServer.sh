@@ -696,6 +696,7 @@ PYEOF
       fi
 
       # Upload
+      local FILE_SIZE=$(du -h "$FILE" | cut -f1)
       local UPLOAD_OK=false
       for RETRY in 1 2 3; do
         HTTP_CODE=$(curl -s --connect-timeout 10 --max-time 120 -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
@@ -703,13 +704,15 @@ PYEOF
           --data-binary "@${FILE}")
         if [ "$HTTP_CODE" = "200" ]; then
           UPLOAD_OK=true
+          echo "[GPU${GPU_IDX}] Frame ${FRAME} uploaded to R2 (${FILE_SIZE})"
           break
         fi
+        echo "[GPU${GPU_IDX}] Retry ${RETRY}: upload for frame ${FRAME} returned HTTP ${HTTP_CODE}"
         sleep 2
       done
 
       if [ "$UPLOAD_OK" = false ]; then
-        echo "[GPU${GPU_IDX}] ERROR: Upload failed for frame ${FRAME}"
+        echo "[GPU${GPU_IDX}] ERROR: Upload failed for frame ${FRAME} after 3 retries"
         break 2
       fi
 
@@ -724,15 +727,29 @@ PYEOF
         RENDER_TIME=$(python3 -c "print(int('${MINUTES}')*60 + float('${SECONDS_PART}'))")
       fi
 
-      # Report progress
-      if [ -n "$RENDER_TIME" ]; then
-        curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
-          -H "Content-Type: application/json" \
-          -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME},\"renderTime\":${RENDER_TIME}}" > /dev/null
-      else
-        curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
-          -H "Content-Type: application/json" \
-          -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME}}" > /dev/null
+      # Report progress (with retry + verification)
+      local PROGRESS_OK=false
+      for RETRY in 1 2 3; do
+        local PROGRESS_RESP
+        if [ -n "$RENDER_TIME" ]; then
+          PROGRESS_RESP=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+            -H "Content-Type: application/json" \
+            -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME},\"renderTime\":${RENDER_TIME}}")
+        else
+          PROGRESS_RESP=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+            -H "Content-Type: application/json" \
+            -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME}}")
+        fi
+        local PROGRESS_SUCCESS=$(echo "$PROGRESS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
+        if [ "$PROGRESS_SUCCESS" = "True" ]; then
+          PROGRESS_OK=true
+          break
+        fi
+        echo "[GPU${GPU_IDX}] Retry ${RETRY}: progress report for frame ${FRAME} not acknowledged"
+        sleep 2
+      done
+      if [ "$PROGRESS_OK" = false ]; then
+        echo "[GPU${GPU_IDX}] WARNING: Progress report for frame ${FRAME} failed after 3 retries"
       fi
 
       # Remove from active frames tracking
@@ -898,15 +915,50 @@ if [ "$CANCELLED" = true ]; then
   exit 0
 fi
 
-# Check completion
+# Check completion and sweep for missing frames
 FINAL_CHECK=$(curl -s "${FOTON_API_URL}/instances/render-config?taskId=${FOTON_TASK_ID}&token=${FOTON_INSTANCE_TOKEN}")
-COMPLETED_COUNT=$(echo "$FINAL_CHECK" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('completedFrames',[])))" 2>/dev/null)
+COMPLETED_FRAMES_JSON=$(echo "$FINAL_CHECK" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('completedFrames',[])))" 2>/dev/null)
+COMPLETED_COUNT=$(echo "$COMPLETED_FRAMES_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+
+if [ "$COMPLETED_COUNT" -lt "$TOTAL_FRAMES" ]; then
+  echo "[Foton] Only ${COMPLETED_COUNT}/${TOTAL_FRAMES} acknowledged. Sweeping for missing frames..."
+
+  # Find which frames are missing and re-report them
+  MISSING_FRAMES=$(python3 -c "
+import json
+completed = set(json.loads('${COMPLETED_FRAMES_JSON}'))
+all_frames = list(range(${FRAME_START}, ${FRAME_END} + 1, ${FRAME_INC}))
+missing = [f for f in all_frames if f not in completed]
+print(' '.join(str(f) for f in missing))
+" 2>/dev/null)
+
+  RECOVERED=0
+  for FRAME in $MISSING_FRAMES; do
+    echo "[Foton] Re-reporting frame ${FRAME}..."
+    for RETRY in 1 2 3; do
+      RESP=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${FOTON_API_URL}/instances/progress" \
+        -H "Content-Type: application/json" \
+        -d "{\"taskId\":\"${FOTON_TASK_ID}\",\"token\":\"${FOTON_INSTANCE_TOKEN}\",\"currentFrame\":${FRAME},\"completedFrame\":${FRAME}}")
+      SUCCESS=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
+      if [ "$SUCCESS" = "True" ]; then
+        RECOVERED=$(( RECOVERED + 1 ))
+        echo "[Foton] Frame ${FRAME} recovered."
+        break
+      fi
+      sleep 2
+    done
+  done
+
+  # Re-check after sweep
+  COMPLETED_COUNT=$(( COMPLETED_COUNT + RECOVERED ))
+  echo "[Foton] After sweep: ${COMPLETED_COUNT}/${TOTAL_FRAMES} frames acknowledged (recovered ${RECOVERED})."
+fi
 
 if [ "$COMPLETED_COUNT" -ge "$TOTAL_FRAMES" ]; then
   FINAL_STATUS="completed"
 else
   FINAL_STATUS="failed"
-  echo "[Foton] Only ${COMPLETED_COUNT}/${TOTAL_FRAMES} frames completed."
+  echo "[Foton] Still missing $(( TOTAL_FRAMES - COMPLETED_COUNT )) frames after sweep."
 fi
 
 echo "[Foton] Reporting: ${FINAL_STATUS}"
