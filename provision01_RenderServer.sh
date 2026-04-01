@@ -150,6 +150,7 @@ export MAX_SAMPLES=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.l
 export UPLOAD_TYPE=$(echo "$CONFIG"  | python3 -c "import sys,json; print(json.load(sys.stdin).get('uploadType') or 'blend')" 2>/dev/null)
 export BLEND_RELATIVE_PATH=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('blendRelativePath') or '')" 2>/dev/null)
 export IS_BENCHMARK=$(echo "$CONFIG" | python3 -c "import sys,json; print(1 if json.load(sys.stdin).get('isBenchmark') else 0)")
+export SELECTED_ADDONS_JSON=$(echo "$CONFIG" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('selectedAddons',[])))" 2>/dev/null)
 
 # Map file extension to Blender format
 case "$FILE_EXT" in
@@ -161,6 +162,29 @@ case "$FILE_EXT" in
 esac
 
 echo "[Foton] Config: frames ${FRAME_START}-${FRAME_END} (step ${FRAME_INC}), total=${TOTAL_FRAMES}, ${RES_X}x${RES_Y}, engine=${RENDER_ENGINE}, samples=${MAX_SAMPLES}"
+
+# ── Disk space info ──
+DISK_TOTAL=$(df -h / | awk 'NR==2{print $2}')
+DISK_USED=$(df -h / | awk 'NR==2{print $3}')
+DISK_FREE=$(df -h / | awk 'NR==2{print $4}')
+echo "[Foton] Disk: ${DISK_TOTAL} total, ${DISK_USED} used, ${DISK_FREE} free"
+
+# ── Install selected Blender add-ons from extensions.blender.org ──
+if [ -n "$SELECTED_ADDONS_JSON" ] && [ "$SELECTED_ADDONS_JSON" != "[]" ]; then
+  echo "[Foton] Installing Blender add-ons..."
+  python3 -c "
+import json, subprocess, sys
+addons = json.loads(sys.argv[1])
+for addon_id in addons:
+    print(f'[Foton] Installing extension: {addon_id}')
+    result = subprocess.run(['/opt/blender/blender', '--command', 'extension', 'install', addon_id], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'[Foton] Warning: Failed to install {addon_id}: {result.stderr.strip()}')
+    else:
+        print(f'[Foton] Installed {addon_id}')
+" "$SELECTED_ADDONS_JSON"
+  echo "[Foton] Add-on installation complete"
+fi
 
 if [ "$IS_BENCHMARK" = "1" ]; then
 
@@ -222,6 +246,10 @@ scene.render.image_settings.file_format = FILE_FORMAT
 scene.render.filepath = f"/root/output/{OUTPUT_NAMING}_"
 scene.render.use_file_extension = True
 print(f"[Foton] Bench setup: {RES_X}x{RES_Y}, frames {FRAME_START}-{FRAME_END} step {FRAME_INC}, engine={ENGINE}, format={FILE_FORMAT}, samples={SAMPLES}")
+
+# List all enabled add-ons
+enabled = [mod.module for mod in bpy.context.preferences.addons]
+print(f"[Foton] Active add-ons ({len(enabled)}): {', '.join(sorted(enabled))}")
 PYEOF
 
 report_status "rendering"
@@ -629,6 +657,10 @@ scene.render.filepath = "/root/output/${OUTPUT_NAMING}_"
 scene.render.use_file_extension = True
 
 print(f"[GPU${GPU_IDX}] Configured: frames {scene.frame_start}-{scene.frame_end} step {scene.frame_step}")
+
+# List all enabled add-ons
+enabled = [mod.module for mod in bpy.context.preferences.addons]
+print(f"[GPU${GPU_IDX}] Active add-ons ({len(enabled)}): {', '.join(sorted(enabled))}")
 PYEOF
 
   # Launch Blender in background with -a (animation render)
