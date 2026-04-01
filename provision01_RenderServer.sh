@@ -171,26 +171,89 @@ echo "[Foton] Disk: ${DISK_TOTAL} total, ${DISK_USED} used, ${DISK_FREE} free"
 
 # ── Install selected Blender add-ons from extensions.blender.org ──
 if [ -n "$SELECTED_ADDONS_JSON" ] && [ "$SELECTED_ADDONS_JSON" != "[]" ]; then
-  echo "[Foton] Syncing Blender extension repository..."
-  /opt/blender/blender --command extension repo-sync 2>&1 || echo "[Foton] Warning: repo-sync failed, trying install anyway"
-
   echo "[Foton] Installing Blender add-ons..."
-  python3 -c "
-import json, subprocess, sys
-addons = json.loads(sys.argv[1])
-for addon_id in addons:
-    print(f'[Foton] Installing extension: {addon_id}')
+  python3 << 'ADDON_SCRIPT'
+import json, subprocess, sys, os
+import urllib.request, urllib.error
+
+ADDONS_JSON = os.environ.get("SELECTED_ADDONS_JSON", "[]")
+addons_to_install = json.loads(ADDONS_JSON)
+if not addons_to_install:
+    sys.exit(0)
+
+print(f"[Foton] Add-ons requested: {addons_to_install}")
+
+# Step 1: Fetch the full extension catalog from extensions.blender.org
+print("[Foton] Fetching extension catalog...")
+try:
+    req = urllib.request.Request(
+        "https://extensions.blender.org/api/v1/extensions/",
+        headers={"User-Agent": "FotonRender/1.0"}
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        catalog = json.loads(resp.read().decode())
+    print(f"[Foton] Catalog fetched: {len(catalog.get('data', []))} entries")
+except Exception as e:
+    print(f"[Foton] ERROR: Could not fetch catalog: {e}")
+    sys.exit(0)
+
+# Step 2: Find archive URLs for each addon (prefer linux-x64 or platform-agnostic)
+url_map = {}
+for ext in catalog.get("data", []):
+    eid = ext.get("id")
+    if eid not in addons_to_install:
+        continue
+    platforms = ext.get("platforms", [])
+    if not platforms or "linux-x64" in platforms:
+        url_map[eid] = ext.get("archive_url", "")
+
+# Step 3: Download and install each addon
+installed = []
+for addon_id in addons_to_install:
+    url = url_map.get(addon_id)
+    if not url:
+        print(f"[Foton] Warning: {addon_id} not found in catalog (or not available for linux-x64)")
+        continue
+
+    zip_path = f"/tmp/{addon_id}.zip"
+    try:
+        print(f"[Foton] Downloading {addon_id}...")
+        urllib.request.urlretrieve(url, zip_path)
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        print(f"[Foton] Downloaded {addon_id} ({size_mb:.1f} MB)")
+    except Exception as e:
+        print(f"[Foton] Warning: Download failed for {addon_id}: {e}")
+        continue
+
+    print(f"[Foton] Installing {addon_id}...")
     result = subprocess.run(
-        ['/opt/blender/blender', '--command', 'extension', 'install', addon_id, '--enable'],
-        capture_output=True, text=True
+        ["/opt/blender/blender", "--command", "extension", "install-file", zip_path, "--enable"],
+        capture_output=True, text=True, timeout=120
     )
     output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
-        print(f'[Foton] Warning: Failed to install {addon_id}: {output}')
+        print(f"[Foton] Warning: install-file failed for {addon_id}: {output[-300:]}")
+        # Fallback: try CLI install (in case sync works on this Blender version)
+        print(f"[Foton] Trying fallback: CLI sync + install for {addon_id}...")
+        subprocess.run(["/opt/blender/blender", "--command", "extension", "sync"], capture_output=True, timeout=60)
+        result2 = subprocess.run(
+            ["/opt/blender/blender", "--command", "extension", "install", addon_id, "--enable"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result2.returncode == 0:
+            print(f"[Foton] Installed {addon_id} (via fallback)")
+            installed.append(addon_id)
+        else:
+            print(f"[Foton] FAILED to install {addon_id}")
     else:
-        print(f'[Foton] Installed {addon_id}')
-" "$SELECTED_ADDONS_JSON"
-  echo "[Foton] Add-on installation complete"
+        print(f"[Foton] Installed {addon_id}")
+        installed.append(addon_id)
+
+    try: os.remove(zip_path)
+    except: pass
+
+print(f"[Foton] Add-on installation complete: {len(installed)}/{len(addons_to_install)} installed")
+ADDON_SCRIPT
 fi
 
 if [ "$IS_BENCHMARK" = "1" ]; then
