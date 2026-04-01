@@ -172,6 +172,9 @@ echo "[Foton] Disk: ${DISK_TOTAL} total, ${DISK_USED} used, ${DISK_FREE} free"
 # ── Install selected Blender add-ons from extensions.blender.org ──
 if [ -n "$SELECTED_ADDONS_JSON" ] && [ "$SELECTED_ADDONS_JSON" != "[]" ]; then
   echo "[Foton] Installing Blender add-ons: $SELECTED_ADDONS_JSON"
+  echo "[Foton] Syncing extension repository index..."
+  /opt/blender/blender --online-mode --command extension sync 2>&1
+  echo "[Foton] Sync complete, installing add-ons..."
   /opt/blender/blender --online-mode -b --python-expr "
 import bpy, json, os
 
