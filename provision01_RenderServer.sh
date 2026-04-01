@@ -171,15 +171,22 @@ echo "[Foton] Disk: ${DISK_TOTAL} total, ${DISK_USED} used, ${DISK_FREE} free"
 
 # ── Install selected Blender add-ons from extensions.blender.org ──
 if [ -n "$SELECTED_ADDONS_JSON" ] && [ "$SELECTED_ADDONS_JSON" != "[]" ]; then
+  echo "[Foton] Syncing Blender extension repository..."
+  /opt/blender/blender --command extension repo-sync 2>&1 || echo "[Foton] Warning: repo-sync failed, trying install anyway"
+
   echo "[Foton] Installing Blender add-ons..."
   python3 -c "
 import json, subprocess, sys
 addons = json.loads(sys.argv[1])
 for addon_id in addons:
     print(f'[Foton] Installing extension: {addon_id}')
-    result = subprocess.run(['/opt/blender/blender', '--command', 'extension', 'install', addon_id], capture_output=True, text=True)
+    result = subprocess.run(
+        ['/opt/blender/blender', '--command', 'extension', 'install', addon_id, '--enable'],
+        capture_output=True, text=True
+    )
+    output = (result.stdout + result.stderr).strip()
     if result.returncode != 0:
-        print(f'[Foton] Warning: Failed to install {addon_id}: {result.stderr.strip()}')
+        print(f'[Foton] Warning: Failed to install {addon_id}: {output}')
     else:
         print(f'[Foton] Installed {addon_id}')
 " "$SELECTED_ADDONS_JSON"
